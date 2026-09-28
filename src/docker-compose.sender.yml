@@ -1,0 +1,77 @@
+# Отправщик на один аккаунт: поднимается своим проектом рядом с основным
+# контуром (`docker-compose.local.yml`) и берёт строки из его очереди.
+#
+# Зачем отдельный файл: одному аккаунту нужен один процесс со своей сессией
+# MTProto, а перечислять app2, app3 в основном compose нельзя - обязательная
+# переменная внутри профиля ломает интерполяцию всего файла даже когда профиль
+# не поднимают (проверено 11.09.2026). Здесь описан ровно один отправщик, а
+# список аккаунтов живёт в именах проектов и файлах accounts/<метка>.env.
+#
+# Запускается только целями `account-*` Makefile: они задают LABEL и TRANSPORT
+# и проверяют, что метка аккаунта не совпала с меткой основного контура.
+#
+# Управления здесь нет: MCP держит ровно один экземпляр - основной контур.
+# Наружу не публикуется ни один порт, к базе и к соседям процесс ходит по
+# внутренней сети основного контура.
+
+services:
+  app:
+    build: .
+    # Своё у аккаунта: метка, телефон, ключи приложения Telegram, при
+    # необходимости прокси и потолок. Ключи не наследуются от главного контура
+    # намеренно: они берутся на my.telegram.org под номером аккаунта.
+    # Общие настройки контура идут ниже из src/.env: список служебных адресатов,
+    # окно и пороги обязаны совпадать у всех процессов - они участвуют в счёте
+    # расхода и в рубежах, и разъехавшись, сняли бы рубеж не с того человека.
+    env_file:
+      - accounts/${LABEL}.env
+    environment:
+      ENV: ${ENV:-prod}
+      DATABASE_URL: postgres://tg_agent_mcp:${POSTGRES_PASSWORD}@postgres:5432/tg_agent_mcp?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Своё имя переменной, а не общий TRANSPORT: тот стоит в src/.env живым
+      # режимом и молча включил бы отправку на аккаунте, в который ещё не вошли.
+      # Задаётся целью: account-up поднимает отправщик в dry-run для входа,
+      # account-live - в живом режиме.
+      TRANSPORT: ${SENDER_TRANSPORT:-dry-run}
+      SEND_WINDOW_START: ${SEND_WINDOW_START:-10:00}
+      SEND_WINDOW_END: ${SEND_WINDOW_END:-19:00}
+      SEND_PAUSE_MIN: ${SEND_PAUSE_MIN:-10m}
+      SEND_PAUSE_MAX: ${SEND_PAUSE_MAX:-30m}
+      FLOOD_WAIT_THRESHOLD: ${FLOOD_WAIT_THRESHOLD:-10m}
+      CLAIM_STALE_AFTER: ${CLAIM_STALE_AFTER:-5m}
+      DEV_ALLOW_LIST: ${DEV_ALLOW_LIST:-}
+      # Вечерняя сводка: метка аккаунта, который её отправляет, и её получатели.
+      # Пусто - прежнее поведение: шлёт любой отправщик всем служебным адресатам.
+      DIGEST_ACCOUNT: ${DIGEST_ACCOUNT:-}
+      DIGEST_TO: ${DIGEST_TO:-}
+      MCP_ENABLED: "false"
+      HEALTH_ADDR: ":8081"
+      TELEGRAM_STORAGE_PATH: /var/lib/tg-agent-mcp/telegram.db
+    # Том проекта, а не общий: файл сессии у каждого аккаунта свой, иначе вход в
+    # один аккаунт затёр бы сессию соседа.
+    volumes:
+      - telegram_data:/var/lib/tg-agent-mcp
+    healthcheck:
+      test: ["CMD", "/app", "healthcheck"]
+      interval: 15s
+      timeout: 7s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Сеть основного контура: по ней отправщик ходит в базу кампаний по имени
+# сервиса postgres. Своей базы у отправщика нет и быть не должно - очередь,
+# потолки и журнал касаний одни на все аккаунты.
+networks:
+  default:
+    name: tg-agent-mcp-live_default
+    external: true
+
+volumes:
+  telegram_data:

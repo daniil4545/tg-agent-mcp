@@ -1,0 +1,118 @@
+# Боевой контур на машине владельца: MCP-сервер и отправщик рядом с Claude Code.
+#
+# Решение владельца 02.09.2026: сервис живёт локально, а не на VPS. Причины
+# три - Claude Code ходит на 127.0.0.1 и не нужен ни домен, ни туннель;
+# отправка идёт с домашнего IP, а не с датацентрового, что для живого
+# Telegram-аккаунта естественнее; наружу не открыто ничего.
+#
+# Цена: рассылка идёт, пока машина включена. Дневная порция небольшая, окно
+# 10:00-19:00 будней, так что обычного рабочего дня хватает; сутки сна означают
+# сутки без отправок, а не потерю очереди.
+#
+# Проект и тома отдельные от docker-compose.yml: тот поднимает базу для тестов,
+# и `make test` её пересобирает. Держать в ней очередь кампании нельзя - там
+# лежит знание, кому уже писали.
+name: tg-agent-mcp-live
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: tg_agent_mcp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: tg_agent_mcp
+    # Порт наружу не публикуется: к базе ходит только приложение в этой сети.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tg_agent_mcp -d tg_agent_mcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    build: .
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: postgres://tg_agent_mcp:${POSTGRES_PASSWORD}@postgres:5432/tg_agent_mcp?sslmode=disable
+    command: ["/goose", "-dir", "/migrations", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  app:
+    build: .
+    environment:
+      # prod, потому что живая отправка возможна только в нём; контур боевой,
+      # хоть и стоит на ноутбуке.
+      ENV: ${ENV:-prod}
+      DATABASE_URL: postgres://tg_agent_mcp:${POSTGRES_PASSWORD}@postgres:5432/tg_agent_mcp?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ACCOUNT_LABEL: ${ACCOUNT_LABEL:?ACCOUNT_LABEL must be set}
+      ACCOUNT_DAILY_LIMIT: ${ACCOUNT_DAILY_LIMIT:-20}
+      # dry-run по умолчанию: live включается руками после входа в аккаунт и
+      # пилота на своих.
+      TRANSPORT: ${TRANSPORT:-dry-run}
+      SEND_WINDOW_START: ${SEND_WINDOW_START:-10:00}
+      SEND_WINDOW_END: ${SEND_WINDOW_END:-19:00}
+      # Пауза - весь виток отправщика: на ней он замечает и старт кампании, и
+      # открытие окна. 10-30 минут - темп пилота 07.09.2026.
+      SEND_PAUSE_MIN: ${SEND_PAUSE_MIN:-10m}
+      SEND_PAUSE_MAX: ${SEND_PAUSE_MAX:-30m}
+      FLOOD_WAIT_THRESHOLD: ${FLOOD_WAIT_THRESHOLD:-10m}
+      CLAIM_STALE_AFTER: ${CLAIM_STALE_AFTER:-5m}
+      # Последний рубеж: пусто - ограничения нет, список - писать можно только
+      # перечисленным. На пилоте здесь стоят свои ники.
+      DEV_ALLOW_LIST: ${DEV_ALLOW_LIST:-}
+      # Вечерняя сводка: метка аккаунта, который её отправляет, и её получатели.
+      # Пусто - прежнее поведение: шлёт любой отправщик всем служебным адресатам.
+      DIGEST_ACCOUNT: ${DIGEST_ACCOUNT:-}
+      DIGEST_TO: ${DIGEST_TO:-}
+      MCP_ENABLED: "true"
+      MCP_ADDR: ":8080"
+      MCP_TOKEN: ${MCP_TOKEN:?MCP_TOKEN must be set}
+      MCP_AGENT_TOKEN: ${MCP_AGENT_TOKEN:-}
+      AGENT_ALLOW_LIST: ${AGENT_ALLOW_LIST:-}
+      HEALTH_ADDR: ":8081"
+      TELEGRAM_APP_ID: ${TELEGRAM_APP_ID:-}
+      TELEGRAM_APP_HASH: ${TELEGRAM_APP_HASH:-}
+      TELEGRAM_PHONE: ${TELEGRAM_PHONE:-}
+      TELEGRAM_STORAGE_PATH: /var/lib/tg-agent-mcp/telegram.db
+      TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-}
+    volumes:
+      - telegram_data:/var/lib/tg-agent-mcp
+    # Только петля: эндпоинт не должен быть виден даже в домашней сети.
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8087}:8080"
+      - "127.0.0.1:${HEALTH_PORT:-8088}:8081"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/app", "healthcheck"]
+      interval: 15s
+      timeout: 7s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pgdata:
+  telegram_data:

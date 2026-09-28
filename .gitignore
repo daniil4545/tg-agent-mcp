@@ -1,0 +1,45 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Per-account sender settings: real phone numbers of live accounts
+/src/accounts/*.env
+
+# Telegram MTProto session and peer cache: never enters git
+*.bolt
+*.bbolt
+telegram.db
+session/
+
+# Recipient lists and reports: contain personal data
+/exports/
+*.csv
+*.xlsx
+
+# Campaign database dumps: names and Telegram nicks of real people
+/backups/
+*.sql.gz
+
+# Go artifacts
+/bin/
+/dist/
+/tmp/
+vendor/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local AI tool state
+.claude/settings.local.json
+.claude/projects/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

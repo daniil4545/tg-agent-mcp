@@ -1,0 +1,32 @@
+# Локальный Postgres для разработки. Имя проекта задано явно: по умолчанию
+# Compose берёт его из имени каталога, а каталог src есть у каждого сервиса
+# - без этой строки тома разных проектов сошлись бы в один.
+#
+# Порт 5433, не 5432: соседний сервис lead-qualifier поднимает свой
+# Postgres на 5432, и оба сервиса не редкость держать поднятыми одновременно.
+name: tg-agent-mcp
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: tg_agent_mcp
+      POSTGRES_PASSWORD: tg_agent_mcp
+      POSTGRES_DB: tg_agent_mcp
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tg_agent_mcp -d tg_agent_mcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pgdata:
