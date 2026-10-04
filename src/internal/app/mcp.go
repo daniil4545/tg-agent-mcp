@@ -77,6 +77,9 @@ type dialogsArgs struct {
 	Limit int `json:"limit,omitempty" jsonschema:"сколько диалогов показать; без значения двадцать, потолок сто"`
 }
 
+// hint даёт указатель для полей подсказок MCP, где SDK отличает «не указано» от false.
+func hint(value bool) *bool { return &value }
+
 // NewMCPServer собирает MCP-сервер управления кампанией.
 func NewMCPServer(service *Service, chat *Chat) *mcp.Server {
 	handlers := &tools{service: service, chat: chat}
@@ -85,55 +88,61 @@ func NewMCPServer(service *Service, chat *Chat) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "load_campaign",
 		Description: "Создать черновик рассылки с шаблоном сообщения. Прежний черновик отменяется.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(true), IdempotentHint: false, OpenWorldHint: hint(false)},
 	}, handlers.loadCampaign)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_recipients",
 		Description: "Добавить пачку получателей (до 50) в черновик и получить отчёт отсева с превью сообщения. Для служебных адресатов из DEV_ALLOW_LIST правило «одно сообщение» не действует, стоп-лист - действует.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: false, OpenWorldHint: hint(false)},
 	}, handlers.addRecipients)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "start",
 		Description: "Запустить черновик или продолжить кампанию с паузы.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: false, OpenWorldHint: hint(true)},
 	}, handlers.start)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "stop",
 		Description: "Поставить кампанию на паузу или отменить её вместе с очередью.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(true), IdempotentHint: true, OpenWorldHint: hint(false)},
 	}, handlers.stop)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "resume_account",
 		Description: "Снять стоп с аккаунта после проверки человеком.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(false)},
 	}, handlers.resumeAccount)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "status",
 		Description: "Счётчики кампании, аккаунты со стопами и превью сообщения; campaign_id показывает названную кампанию, full добавляет построчный итог.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(false)},
 	}, handlers.status)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_find",
 		Description: "Найти человека: точный ник или имя среди контактов и своих диалогов. Точное совпадение ника идёт первым с пометкой, без него показываются похожие ники с предупреждением. Наружу поиск ничего не пишет.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(true)},
 	}, handlers.find)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_send",
 		Description: "Написать человеку в личку руками. Первое касание незнакомца идёт в окно отправки и в дневной потолок; после отправки человек закрыт для кампаний. Для служебных адресатов из DEV_ALLOW_LIST окно, потолок и правило «одно сообщение» не действуют, стоп-лист - действует.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: false, OpenWorldHint: hint(true)},
 	}, handlers.send)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_read",
 		Description: "Показать личный диалог и, если попросили, дождаться чужой реплики; группы и каналы не читаются.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(true)},
 	}, handlers.read)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_dialogs",
 		Description: "Список диалогов - личных, групп и каналов - с непрочитанными и последним сообщением; вид каждой строки назван, писать (tg_send) можно только человеку.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(true)},
 	}, handlers.dialogs)
 
 	return server
@@ -237,12 +246,13 @@ func NewAgentServer(service *Service, chat *Chat) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_send",
 		Description: "Написать тестовому аккаунту из AGENT_ALLOW_LIST в личку, чтобы проверить бота. Любой другой ник сервис отклоняет.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: false, OpenWorldHint: hint(true)},
 	}, handlers.send)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_read",
 		Description: "Показать личный диалог с тестовым аккаунтом из AGENT_ALLOW_LIST и, если попросили, дождаться его реплики.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(true)},
 	}, handlers.read)
 
 	return server
