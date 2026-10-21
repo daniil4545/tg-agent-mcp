@@ -396,9 +396,9 @@ func TestDirectSendRefusedByGuards(t *testing.T) {
 			prepare: func(t *testing.T, service *Service, _ *stubDialog) {
 				runSQL(t, service, `INSERT INTO stop_list (username) VALUES ('ivan_petrov')`)
 			}},
-		// A stop-list entry without a username: the username is linked to the amoCRM
-		// contact through campaign rows, otherwise the gate is bypassed with a username.
-		{name: "stop list by amoCRM contact", username: "ivan_petrov", want: ErrStopList,
+		// A stop-list entry without a username: the username is linked to the contact id
+		// through campaign rows, otherwise the gate is bypassed with a username.
+		{name: "stop list by contact id", username: "ivan_petrov", want: ErrStopList,
 			prepare: func(t *testing.T, service *Service, _ *stubDialog) {
 				startWith(t, service, person(1, "ivan_petrov"))
 				runSQL(t, service, `INSERT INTO stop_list (amo_contact_id) VALUES (1)`)

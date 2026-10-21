@@ -1,8 +1,7 @@
-# Live stack on the owner's machine: the MCP server and the sender next to
+# Live stack on the operator's machine: the MCP server and the sender next to
 # Claude Code.
 #
-# Owner's decision of 2026-09-02: the service runs locally, not on a VPS.
-# Three reasons: Claude Code connects to 127.0.0.1, so no domain or tunnel is
+# The service runs locally, not on a VPS. Three reasons: Claude Code connects to 127.0.0.1, so no domain or tunnel is
 # needed; sending goes from a home IP rather than a datacenter one, which is
 # more natural for a live Telegram account; nothing is exposed outside.
 #
@@ -65,19 +64,19 @@ services:
       ACCOUNT_LABEL: ${ACCOUNT_LABEL:?ACCOUNT_LABEL must be set}
       ACCOUNT_DAILY_LIMIT: ${ACCOUNT_DAILY_LIMIT:-20}
       # dry-run by default: live is switched on by hand after logging in to the
-      # account and a pilot on the owner's own accounts.
+      # account and a trial send to the operator's own accounts.
       TRANSPORT: ${TRANSPORT:-dry-run}
       SEND_WINDOW_START: ${SEND_WINDOW_START:-10:00}
       SEND_WINDOW_END: ${SEND_WINDOW_END:-19:00}
       # The pause is the whole sender iteration: it is when the sender notices
-      # both a campaign start and the window opening. 10-30 minutes is the pilot
-      # pace of 2026-09-07.
+      # both a campaign start and the window opening. 10-30 minutes is the default
+      # pace.
       SEND_PAUSE_MIN: ${SEND_PAUSE_MIN:-10m}
       SEND_PAUSE_MAX: ${SEND_PAUSE_MAX:-30m}
       FLOOD_WAIT_THRESHOLD: ${FLOOD_WAIT_THRESHOLD:-10m}
       CLAIM_STALE_AFTER: ${CLAIM_STALE_AFTER:-5m}
       # Last guard: empty means no restriction, a list means only the listed
-      # people may be messaged. During the pilot this holds the owner's own
+      # people may be messaged. During a trial this holds the operator's own
       # usernames.
       DEV_ALLOW_LIST: ${DEV_ALLOW_LIST:-}
       # Evening digest: label of the account that sends it, and its recipients.

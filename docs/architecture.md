@@ -12,7 +12,7 @@ account. The "one message" boundary is held by touch accounting, not by
 hardware isolation.
 
 The service does not call any external list source: selecting recipients is
-the caller's job and lives in a separate project (`campaigns`).
+the caller's job and lives outside this project.
 
 The whole campaign state is in PostgreSQL, so a restart loses neither the
 place in the list nor the boundaries. There can be several accounts: each is
@@ -71,8 +71,8 @@ cancelled with `stop --cancel`.
 
 **Name boundary.** `name_braces` is a CRM name with a brace in it (only when
 `{имя}` is in the template). An empty name is not a boundary: `RenderMessage`
-removes the substitution together with the comma (`no_name` has not been set
-since 2026-09-07). The name boundary and `text_too_long` are checked again on
+removes the substitution together with the comma (`no_name` is no longer
+set). The name boundary and `text_too_long` are checked again on
 the row taken from the queue, not only on import. Length is not expressible in
 SQL (UTF-16: a character outside the BMP takes two code units).
 
@@ -167,7 +167,7 @@ addressee storage, other temporary. Next to the kind is the MTProto error code
 (`FLOOD_WAIT`, `MSG_ID_INVALID`). A restriction belongs to the account, not to
 the call: `PEER_FLOOD`, a long `FLOOD_WAIT` and a revoked session stop the
 whole account. The stop is not lifted by a timer: `resume_account` is for a
-Telegram restriction, `authorize` (`docs/first-launch.md`) is for a revoked
+Telegram restriction, `authorize` (`docs/setup.md`) is for a revoked
 session. Only a short `FLOOD_WAIT` is waited out.
 
 **MCP.** `modelcontextprotocol/go-sdk` (v1): streamable HTTP,
@@ -179,11 +179,11 @@ by Claude's standard permission mechanism. The endpoint is one instance
 
 **List sources.** The service calls none at all (no CRM, no files, no foreign
 databases); the only input is `add_recipients`. Knowledge of the data layout
-lives in `campaigns`.
+stays with the caller.
 
 ## Environments and configuration
 
-There is one environment, and it is the production one, on the owner's machine.
+There is one environment, and it is the production one, on the operator's machine.
 Transport: `dry-run` writes to the log and does not go outside; `live` goes
 through MTProto and does not start outside `ENV=prod`.
 
@@ -210,7 +210,7 @@ tick: 20 messages = 19 pauses, ~6h20m against a 9-hour window; the extreme case
 | The window and the cap hold both the campaign and a first touch to a stranger | check in the send transaction, counted from the DB; a warm reply is deliberately exempt |
 | An account restriction stops only that account | stop at the account level |
 | The stop is not lifted by a timer | lifted only by a tool, on a human command |
-| The stop list is closed for manual sending too | check by username and by amoCRM contact |
+| The stop list is closed for manual sending too | check by username and by contact id |
 | Without a usable username, and under `{имя}` with a brace, a person does not go to sending | import filter plus a repeat on the row taken from the queue; length is checked on the taken row |
 | A message with an unparsed brace does not go out | check in `load_campaign`/`AddRecipients`/`StartCampaign`; `ClaimNext` returns no row |
 | The service does not call external list sources | there is no client for them in the service (reviewed, passed twice) |
@@ -219,11 +219,10 @@ tick: 20 messages = 19 pauses, ~6h20m against a 9-hour window; the extreme case
 
 Main decisions:
 
-A separate service (not a function of the lead-handling system, so that a flood stop does
-not silence inbound leads); several accounts mean several instances with a
+A separate service (not a function of the caller, so that a flood stop does
+not silence its other work); several accounts mean several instances with a
 shared queue (one MTProto session per process); the text is a template plus
-`{имя}`, without free rewriting; segment selection outside the service
-(`campaigns`); no Telegram bot, management is MCP; resolve by phone number is
+`{имя}`, without free rewriting; segment selection outside the service; no Telegram bot, management is MCP; resolve by phone number is
 off by default; one account for campaigns and dialogs, and the boundary is the
 touch journal, not the account role; the boundary is on a cold contact, not on
 a tool; the journal is written before the network call; the journal key is the

@@ -128,7 +128,7 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
-	// The 10-30 minute default was set by the 2026-09-07 pilot: the message text
+	// The 10-30 minute default: the message text
 	// is the same for all recipients, and the pause spread is the only thing
 	// that makes the campaign pace differ from a machine's. The price is
 	// responsiveness: the sender notices a campaign start, a window opening and an empty queue after the same pause.

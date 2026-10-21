@@ -175,8 +175,7 @@ account-authorize: check-account
 
 # Live mode: the container is recreated with TRANSPORT=live on the same session.
 # --build is required: without it up recreates the container on the old image
-# and the sender silently stays on old code (caught on the v0.9.0 rollout,
-# 2026-09-23).
+# and the sender silently stays on old code.
 account-live: check-account
 	LABEL=$(label) SENDER_TRANSPORT=live $(SENDER) -p $(SENDER_PROJECT) up -d --build
 	@echo "sender $(label) switched to live; status shows spend and the reason for any idle time"

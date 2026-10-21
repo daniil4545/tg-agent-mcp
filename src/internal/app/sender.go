@@ -170,7 +170,7 @@ func (s *Sender) SendClaimed(ctx context.Context, item *Recipient) error {
 // OnMessage is the connection point to the live transport: telegram.Client
 // hands the normalized incoming message here (signature telegram.Handler). The
 // link with the gotd dispatcher itself is not part of the slice and runs live
-// for the first time in the pilot.
+// only against a real account.
 //
 // A private message from a person closes their row: a sent one moves to
 // replied, a not yet sent one too, and the invitation is cancelled.

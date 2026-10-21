@@ -33,8 +33,8 @@ type loadArgs struct {
 }
 
 type personArgs struct {
-	ContactID int64  `json:"contact_id" jsonschema:"amoCRM contact id"`
-	LeadID    int64  `json:"lead_id,omitempty" jsonschema:"amoCRM lead id"`
+	ContactID int64  `json:"contact_id" jsonschema:"contact id in the caller's CRM or list"`
+	LeadID    int64  `json:"lead_id,omitempty" jsonschema:"lead or deal id in the caller's CRM; optional"`
 	Name      string `json:"name" jsonschema:"name substituted into the template"`
 	Username  string `json:"username" jsonschema:"Telegram username; a person without one is not added to the campaign"`
 }
@@ -901,9 +901,9 @@ var stateLabels = map[string]string{
 }
 
 var reasonLabels = map[string]string{
-	ReasonBadContact:   "no amoCRM contact id",
+	ReasonBadContact:   "no contact id",
 	ReasonNoUsername:   "no usable Telegram username",
-	ReasonNoName:       "no name (campaigns before 07.09.2026; now the message goes out with no form of address)",
+	ReasonNoName:       "no name (older campaigns; now the message goes out with no form of address)",
 	ReasonWroteFirst:   "wrote first, before their turn in the queue came",
 	ReasonTextTooLong:  "the message with their name is longer than the Telegram limit",
 	ReasonNameBraces:   "the name contains a curly brace, which would end up in the message",

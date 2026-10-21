@@ -563,8 +563,7 @@ func skipDisqualifiedSQL(owners string) string {
 }
 
 // The empty-name gate no longer exists in SQL: a person without a name gets a
-// message without a greeting, and there is no reason to remove their row (owner
-// decision of 02.09.2026).
+// message without a greeting, and there is no reason to remove their row.
 
 // bracedNameSQL matches a curly brace in a name: it would go into the message
 // as is, which is the same symptom the template check guards against.
@@ -578,7 +577,7 @@ const bracedNameSQL = `r.name ~ '[{}]'`
 // process is carrying it.
 //
 // An empty name is no longer a gate: the message goes out without a greeting
-// (owner decision of 02.09.2026, restored on 07.09.2026).
+// (a deliberate choice).
 const skipBadNamesSQL = `UPDATE recipients AS r SET state = 'skipped', claimed_at = NULL,
 	    reason = '` + ReasonNameBraces + `'
 	WHERE r.campaign_id = $1 AND r.state = 'planned'

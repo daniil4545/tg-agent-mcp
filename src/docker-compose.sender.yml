@@ -4,7 +4,7 @@
 # Why a separate file: one account needs one process with its own MTProto
 # session, and listing app2, app3 in the main compose is not possible - a
 # required variable inside a profile breaks interpolation of the whole file even
-# when the profile is not started (verified 2026-09-11). This file describes
+# when the profile is not started. This file describes
 # exactly one sender, and the list of accounts lives in project names and in
 # the files accounts/<label>.env.
 #

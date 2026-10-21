@@ -4,20 +4,20 @@
 # is no ssh here; the file name keeps the usual convention: safe-ssh.sh is
 # an allow-list of actions that read by default and mutate only with "apply".
 #
-# The touch log and campaign rows are edited ONLY for the owner's accounts:
+# The touch log and campaign rows are edited ONLY for the operator's accounts:
 # they are needed for periodic checks of the mailing, and the "one person, one
-# message" guard is lifted for them by hand (owner's decision of 2026-09-06).
+# message" guard is lifted for them by hand (a deliberate choice).
 # The script rejects any other username - this is how the command is built, not
 # an agreement.
 #
 # The list below is deliberately wider than DEV_ALLOW_LIST. DEV_ALLOW_LIST
 # names service recipients for whom the service does not count the window and
-# the cap; here are all the owner's accounts whose traces may be forgotten. An
+# the cap; here are all the operator's accounts whose traces may be forgotten. An
 # account that tests the guards themselves must be outside DEV_ALLOW_LIST and
 # still be cleaned between runs.
 set -euo pipefail
 
-owner_accounts=(smirnov dev_account daniilsukhar manager_one)
+owner_accounts=(operator_one dev_account manager_one manager_two)
 
 compose=(docker compose -f "$(cd "$(dirname "$0")/../src" && pwd)/docker-compose.local.yml")
 psql=("${compose[@]}" exec -T postgres psql -U tg_agent_mcp -d tg_agent_mcp -v ON_ERROR_STOP=1 -P pager=off)
@@ -31,14 +31,14 @@ usage() {
 Usage: deploy/safe-ssh.sh <action> [args...]
 
 Read-only actions:
-  registry-owner            touches and campaign rows of the owner's accounts
+  registry-owner            touches and campaign rows of the operator's accounts
 
 Mutating actions:
-  registry-forget <username> apply   forget the traces of an owner account:
+  registry-forget <username> apply   forget the traces of an operator account:
                                 manual touches are marked failed, rows of past
                                 campaigns are marked cancelled. The import
                                 filter and tg_send no longer see them, the
-                                history stays. Only usernames from the owner
+                                history stays. Only usernames from the operator
                                 list are accepted.
   account-limit <label> <N> apply   daily cap of an account. The cap lives in
                                 the database: ACCOUNT_DAILY_LIMIT sets it only
@@ -75,7 +75,7 @@ case "$action" in
             exit 2
         fi
         if ! is_owner "$arg"; then
-            echo "refusing: @$arg is not an owner account (${owner_accounts[*]})" >&2
+            echo "refusing: @$arg is not an operator account (${owner_accounts[*]})" >&2
             exit 2
         fi
         # Rows are not deleted but marked: the filter and daily-count indexes
@@ -83,8 +83,8 @@ case "$action" in
         # campaign row is closed as cancelled - the import filter treats a
         # person as having received a message in both sent and replied.
         "${psql[@]}" \
-            -c "UPDATE direct_messages SET state = 'failed', reason = 'forgotten: owner account check' WHERE lower(username) = '$arg' AND state <> 'failed';" \
-            -c "UPDATE recipients SET state = 'cancelled', reason = 'forgotten: owner account check' WHERE lower(username) = '$arg' AND state IN ('sent', 'replied');"
+            -c "UPDATE direct_messages SET state = 'failed', reason = 'forgotten: operator account check' WHERE lower(username) = '$arg' AND state <> 'failed';" \
+            -c "UPDATE recipients SET state = 'cancelled', reason = 'forgotten: operator account check' WHERE lower(username) = '$arg' AND state IN ('sent', 'replied');"
         ;;
     account-limit)
         limit="${3:-}"

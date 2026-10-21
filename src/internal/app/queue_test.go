@@ -335,7 +335,7 @@ func TestNoSendWhenAccountStopped(t *testing.T) {
 }
 
 // A person without a name gets a message without a greeting instead of dropping
-// out of the campaign (owner decision of 02.09.2026). Go collapses a name made of
+// out of the campaign (a deliberate choice). Go collapses a name made of
 // a single newline into an empty one, and the greeting is removed entirely -
 // otherwise the message would start with a comma.
 func TestNamelessRowGoesWithoutGreeting(t *testing.T) {

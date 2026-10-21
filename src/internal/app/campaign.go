@@ -126,9 +126,9 @@ const maxBatch = 50
 // Reasons for filtering out or removing a row. The list is closed: a new entry
 // here is a new service decision, not new text in the report.
 const (
-	ReasonBadContact   = "bad_contact"    // no amoCRM contact id
+	ReasonBadContact   = "bad_contact"    // no contact id
 	ReasonNoUsername   = "no_username"    // username is empty or does not look like one
-	ReasonNoName       = "no_name"        // no longer set, found in campaigns before 07.09.2026
+	ReasonNoName       = "no_name"        // no longer set, found only in older campaigns
 	ReasonTextTooLong  = "text_too_long"  // the message with his name exceeds the Telegram limit
 	ReasonNameBraces   = "name_braces"    // the name has a curly brace: it would go into the message
 	ReasonDuplicate    = "duplicate"      // contact or username is already in this campaign
@@ -252,7 +252,7 @@ func withNear(ctx context.Context, q rowQuerier, err error, statuses ...string) 
 }
 
 // Person is a row of the input list. The agent builds the list through its own
-// access to amoCRM: the service itself does not call the CRM.
+// access to a CRM: the service itself does not call the CRM.
 type Person struct {
 	ContactID int64
 	LeadID    int64
@@ -435,7 +435,7 @@ func (s *Service) AddRecipients(ctx context.Context, campaignID int64, people []
 
 // checkPersonSQL answers the import guards in one pass: the stop list,
 // "received in any campaign", "already in this campaign" and a manual touch
-// through tg_send. A person is recognised both by the amoCRM contact and by
+// through tg_send. A person is recognised both by the contact id and by
 // username: one person gets created twice in the CRM. The journal is keyed by
 // username only - a manual touch has no contact_id to take.
 //
@@ -768,8 +768,8 @@ func covered(known [][]int, at int) bool {
 //
 // A brace in the name is checked only where the template substitutes the name:
 // without {имя} it does not enter the message by a single character, and there
-// is nothing to filter the person for. An empty name is not a fault: the owner
-// decided on 02.09.2026 that a person without a usable name stays in the list
+// is nothing to filter the person for. An empty name is not a fault: a person
+// without a usable name stays in the list
 // and the message goes out without the address. RenderMessage removes the
 // substitution.
 func nameFault(template, name string) string {

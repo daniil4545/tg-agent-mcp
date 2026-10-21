@@ -153,7 +153,7 @@ func TestLoadCampaignChecksTemplate(t *testing.T) {
 // A template with {имя} and a person without a name: the recipient is accepted
 // and the address is removed together with the comma - a message starting with
 // a comma goes to nobody, but the person does not vanish from the campaign
-// either (owner's decision 02.09.2026). The CRM name collapses too:
+// either (a deliberate choice). The CRM name collapses too:
 // "Иван\n\nПетров" in a message body looks like a glitch.
 func TestNamelessRecipientKeptWithoutGreeting(t *testing.T) {
 	service := newService(t)
