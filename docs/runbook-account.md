@@ -3,7 +3,7 @@
 Three operations on a live environment: raise the daily cap, replace an account
 after a ban, and add one more account to the mailing. All are done by hand;
 none has an MCP tool. First launch and sign-in to the main account are in
-`first-launch.md`; this document does not repeat them.
+`setup.md`; this document does not repeat them.
 
 ## The account lives in three places
 

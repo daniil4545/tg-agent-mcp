@@ -10,9 +10,8 @@ addresses.
 |---|---|
 | Understand what the service does, which tools it has and how to run it | [../README.md](../README.md) |
 | Understand the design: blocks and files, data, states and flows, observability, external boundaries, decisions | [architecture.md](architecture.md) |
-| Set up a Telegram account and bring it to the first live send | [first-launch.md](first-launch.md) |
 | Raise the daily cap of a live account or replace a banned account | [runbook-account.md](runbook-account.md) |
-| Bring the stack up on the operator's machine from scratch: install, account sign-in, MCP, first campaign | [customer-setup.md](customer-setup.md) |
+| Bring the stack up from scratch: install, account sign-in, MCP, checks, first campaign, daily observation | [setup.md](setup.md) |
 
 ## Not in the map
 
