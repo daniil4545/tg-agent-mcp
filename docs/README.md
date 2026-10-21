@@ -1,26 +1,27 @@
-# Индекс документации
+# Documentation index
 
-Первая ступень поиска: отвечает на вопрос «в каком файле искать», не пересказывая
-содержимое. Факты живут в самих документах, здесь только адреса.
+First step of a search: it answers "which file do I open" and does not retell
+the content. Facts live in the documents themselves; this page holds only
+addresses.
 
-## Куда идти за чем
+## Where to go for what
 
-| Нужно | Файл |
+| Need | File |
 |---|---|
-| Понять, что сервис делает, какие у него инструменты и как его запустить | [../README.md](../README.md) |
-| Разобраться в устройстве: блоки и файлы, данные, состояния и потоки, наблюдаемость, внешние границы, решения | [architecture.md](architecture.md) |
-| Завести Telegram-аккаунт и довести его до первой живой отправки | [first-launch.md](first-launch.md) |
-| Поднять дневной потолок живому аккаунту или заменить забаненный аккаунт | [runbook-account.md](runbook-account.md) |
-| Поднять контур на машине заказчика с нуля: установка, вход в аккаунт, MCP, первая кампания | [customer-setup.md](customer-setup.md) |
+| Understand what the service does, which tools it has and how to run it | [../README.md](../README.md) |
+| Understand the design: blocks and files, data, states and flows, observability, external boundaries, decisions | [architecture.md](architecture.md) |
+| Set up a Telegram account and bring it to the first live send | [first-launch.md](first-launch.md) |
+| Raise the daily cap of a live account or replace a banned account | [runbook-account.md](runbook-account.md) |
+| Bring the stack up on the operator's machine from scratch: install, account sign-in, MCP, first campaign | [customer-setup.md](customer-setup.md) |
 
-## Не в карте
+## Not in the map
 
-| Файл | Почему |
+| File | Why |
 |---|---|
-| `docs/README.md` | Сама карта |
+| `docs/README.md` | The map itself |
 
-## Правило
+## Rule
 
-Карта не хранит фактов о проекте. Появился новый документ или каталог -
-добавляется строка сюда; содержимое строки это вопрос читателя, а не пересказ
-документа.
+The map holds no facts about the project. When a new document or directory
+appears, a row is added here; the content of the row is the reader's question,
+not a summary of the document.

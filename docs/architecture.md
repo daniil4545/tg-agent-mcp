@@ -1,231 +1,248 @@
-# Архитектура tg-agent-mcp
+# tg-agent-mcp architecture
 
-Документ описывает устройство собранного сервиса. Один бинарь, два долгоживущих потока: MCP-сервер управления
-(streamable HTTP) и отправщик на MTProto с живого аккаунта. Оператор - агент:
-приносит готовый список и текст, дальше сервис ведёт кампанию сам.
+This document describes the design of the built service. One binary, two
+long-lived flows: the MCP management server (streamable HTTP) and the MTProto
+sender on a live account. The operator is an agent: it brings a ready list and
+a text, and the service runs the campaign from there.
 
-Две группы инструментов поверх одной живой сессии: шесть кампанийных и четыре
-диалоговых (`tg_find`, `tg_send`, `tg_read`, `tg_dialogs`). Аккаунт общий -
-общие потолок и стоп; отдельного «тестового» нет, рубеж «одно
-сообщение» держится учётом касаний, не изоляцией железа.
+Two groups of tools sit on top of one live session: six campaign tools and
+four dialog tools (`tg_find`, `tg_send`, `tg_read`, `tg_dialogs`). The account
+is shared, so the cap and the stop are shared; there is no separate "test"
+account. The "one message" boundary is held by touch accounting, not by
+hardware isolation.
 
-Сервис не обращается к внешним источникам списков: отбор - работа
-вызывающего, вынесена в отдельный проект (`campaigns`).
+The service does not call any external list source: selecting recipients is
+the caller's job and lives in a separate project (`campaigns`).
 
-Состояние кампании целиком в PostgreSQL - перезапуск не теряет место в списке
-и не обнуляет рубежи. Аккаунтов может быть несколько: каждый - свой экземпляр
-отправщика со своей сессией и стопом, очередь общая.
+The whole campaign state is in PostgreSQL, so a restart loses neither the
+place in the list nor the boundaries. There can be several accounts: each is
+its own sender instance with its own session and stop, and the queue is shared.
 
-## Блоки и файлы
+## Blocks and files
 
-| Блок | Ответственность |
+| Block | Responsibility |
 | --- | --- |
-| MCP-сервер | десять инструментов (шесть кампанийных, четыре диалоговых) |
-| Кампания | импорт списка, отсевы, состояние по каждому человеку |
-| Отправщик | раскладка по дням (окно, паузы, потолок), резолв ника, отправка MTProto, разбор отказов, стоп, входящие |
-| Диалог | ручная переписка и чтение: рубежи `tg_send`, журнал касаний, опрос истории (`chat.go`) |
-| Транспорт | интерфейс отправки/чтения; реализации MTProto и dry-run |
-| Отчёт | сводка кампании и построчный результат |
+| MCP server | ten tools (six campaign, four dialog) |
+| Campaign | list import, filters, per-person state |
+| Sender | day layout (window, pauses, cap), username resolve, MTProto send, failure parsing, stop, inbound messages |
+| Dialog | manual correspondence and reading: `tg_send` boundaries, touch journal, history polling (`chat.go`) |
+| Transport | send/read interface; MTProto and dry-run implementations |
+| Report | campaign summary and per-row result |
 
-Файлы в `src/internal/app/` плоско, имя файла равно ответственности.
+Files in `src/internal/app/` are flat; a file name equals its responsibility.
 
-## Данные
+## Data
 
-Источник истины по людям - список от вызывающего; по кампании и доставке -
-своя база.
+The source of truth about people is the list from the caller; about the
+campaign and delivery it is the service's own database.
 
-| Сущность | Ключевые ограничения |
+| Entity | Key constraints |
 | --- | --- |
-| Кампания (список, текст, состояние) | одна активная в системе; аккаунты делят очередь |
-| Получатель (внешний id, ник, состояние, причина отказа) | пара «кампания-контакт» уникальна - защита от второго сообщения |
-| Аккаунт (дневной потолок, активный стоп) | потолок и стоп в БД, не в памяти/env; в счётчик - отправленные строки, живой claim, холодные ручные касания |
-| Стоп-лист | проверяется перед каждой отправкой, не только на импорте |
-| Журнал касаний `tg_send` (ник, аккаунт, текст, `random_id`, холодность) | ключ - ник; строка ложится до сетевого вызова; `sent`/`pending` закрывают для кампаний |
+| Campaign (list, text, state) | one active in the system; accounts share the queue |
+| Recipient (external id, username, state, failure reason) | the campaign-contact pair is unique, which protects against a second message |
+| Account (daily cap, active stop) | cap and stop are in the DB, not in memory or env; the counter covers sent rows, a live claim and cold manual touches |
+| Stop list | checked before every send, not only on import |
+| `tg_send` touch journal (username, account, text, `random_id`, coldness) | key is the username; the row is written before the network call; `sent` and `pending` close the person for campaigns |
 
-MTProto-сессия и peer cache - в bbolt на volume, отдельно от БД: к аккаунту
-привязан только файл сессии, смена аккаунта не трогает данные кампании.
+The MTProto session and peer cache are in bbolt on a volume, separate from the
+DB: only the session file is bound to the account, so changing the account
+does not touch campaign data.
 
-## Состояния и потоки
+## States and flows
 
-Состояния получателя: `запланирован` → `отправлено` → `ответил`; тупики -
-`не доставлено`, `пропущен`, `отменено`. Терминальны четыре, `отправлено` -
-промежуточное (переход в `ответил`).
+Recipient states: `planned`, then `sent`, then `replied`; dead ends are
+`undelivered`, `skipped`, `cancelled`. Four are terminal; `sent` is
+intermediate (it moves to `replied`).
 
-Поток: `load_campaign` (проверка шаблона, черновик) → `add_recipients` (отсев,
-отчёт) → `start` → отправщик берёт строку в пределах окна/паузы/потолка →
-резолв ника → отправка → терминальное состояние. Входящее сообщение переводит
-адресата в `ответил`; написавшего первым (до отправки) снимает с очереди
-причина `wrote_first` - это не ответ на наше письмо, в метрику не идёт.
+Flow: `load_campaign` (template check, draft), then `add_recipients` (filters,
+report), then `start`, then the sender takes a row within the window, pause and
+cap, resolves the username, sends, and the row reaches a terminal state. An
+inbound message moves the addressee to `replied`; a person who wrote first
+(before our send) is taken off the queue with the reason `wrote_first`. That is
+not a reply to our message and does not count in the metric.
 
-**Проверка шаблона** (`load_campaign`, повторяется на пути к отправке): (1)
-скобки - после разбора `{имя}` не должно остаться ни одной, иначе отказ с
-первыми тремя местами и числом; (2) длина - запас 64 символа не выше предела
-Telegram. Несобранная кампания не чинится сервисом: `ClaimNext` не отдаёт
-строку, `broken_template` идёт ERROR (не INFO), виден в `status`; кампанию
-собирают заново, негодную снимают `stop --cancel`.
+**Template check** (`load_campaign`, repeated on the way to sending): (1)
+braces: after `{имя}` is parsed, no brace may remain, otherwise the call is
+refused with the first three positions and the count; (2) length: a 64-character
+margin below the Telegram limit. The service does not repair a broken campaign:
+`ClaimNext` returns no row, `broken_template` is logged at ERROR (not INFO) and
+is visible in `status`; the campaign is rebuilt, and an unusable one is
+cancelled with `stop --cancel`.
 
-**Рубеж имени.** `name_braces` - имя из CRM со скобкой (только при `{имя}` в
-шаблоне). Пустое имя не рубеж - `RenderMessage` убирает подстановку с запятой
-(`no_name` не выставляется с 07.09.2026). Рубеж имени и `text_too_long`
-проверяются повторно на взятой строке очереди, не только на импорте. Длина в
-SQL невыразима (UTF-16, символ вне BMP - за два кода).
+**Name boundary.** `name_braces` is a CRM name with a brace in it (only when
+`{имя}` is in the template). An empty name is not a boundary: `RenderMessage`
+removes the substitution together with the comma (`no_name` has not been set
+since 2026-09-07). The name boundary and `text_too_long` are checked again on
+the row taken from the queue, not only on import. Length is not expressible in
+SQL (UTF-16: a character outside the BMP takes two code units).
 
-Порядок отсева - часть рубежа: стоп-лист, «уже получал», ручное касание -
-раньше скобки в имени и длины письма.
+The filter order is part of the boundary: stop list, "already received" and
+manual touch come before the brace in the name and the message length.
 
-Журнал ручных касаний: `pending` → `sent`/`failed`. Закрывают человека для
-будущих кампаний `sent` и `pending`. `failed` (`Failure.NotSent`) возвращает
-строку в очередь; `pending` - временный отказ (обрыв, таймаут, обычно 5xx).
-Пока `pending` моложе протухания `claim`, повторный `tg_send` отклоняется
-(`ErrDirectPending`).
+Manual touch journal: `pending`, then `sent` or `failed`. `sent` and `pending`
+close a person for future campaigns. `failed` (`Failure.NotSent`) returns the
+row to the queue; `pending` is a temporary failure (connection drop, timeout,
+usually 5xx). While a `pending` row is younger than the `claim` expiry, a
+repeated `tg_send` is rejected (`ErrDirectPending`).
 
-Холодный - кому не писали, нет входящего. Дневной расход - одна сумма на оба
-канала (`accountUsedSQL`), единый потолок.
+Cold means a person who was not written to and has no inbound message. Daily
+spending is one sum over both channels (`accountUsedSQL`), under a single cap.
 
-## Наблюдаемость
+## Observability
 
-Лог - полный след, не только неудач. INFO: `message sent`, управляющие
-действия MCP (`campaign loaded`, `recipients added`, `campaign started`,
+The log is a full trace, not only failures. INFO: `message sent`, MCP control
+actions (`campaign loaded`, `recipients added`, `campaign started`,
 `campaign stopped`, `account resumed`), `recipient replied`,
-`recipient wrote first`, `sender idle` (метод `IdleReason`, раз на появление
-причины). `broken_template` идёт ERROR, не INFO - остальные простои проходят
-сами, эта только после сборки кампании заново.
+`recipient wrote first`, `sender idle` (method `IdleReason`, once per
+appearance of a reason). `broken_template` is ERROR, not INFO: other idle
+states clear on their own, this one only after the campaign is rebuilt.
 
-Девять причин простоя (`status` и `IdleReason`): `IdleWindowClosed`,
+Nine idle reasons (`status` and `IdleReason`): `IdleWindowClosed`,
 `IdleAccountStop`, `IdleDailyLimit`, `IdleNoCampaign`, `IdleBrokenTemplate`,
 `IdleQueueEmpty`, `IdleQueueBlocked`, `IdleQueueDisqualified`,
-`IdleClaimRaceLost` (последняя - нормальный ход очереди). `Idle` несёт числа
-(«7 из 7», час открытия окна).
+`IdleClaimRaceLost` (the last is a normal queue event). `Idle` carries numbers
+("7 of 7", the hour the window opens).
 
-Ручной канал: INFO `direct message sent` (`cold`, `random_id`, `message_id`),
-INFO `inbound message in manual dialog` (без неё - WARN `inbound message not
-matched`, реальный дефект). ERROR - требует человека: ограничение аккаунта,
-невозможность авторизоваться, недоставленная запись в базу, `direct message
-stuck pending` на старте. Обычный отказ по адресату - WARN и строка отчёта.
+Manual channel: INFO `direct message sent` (`cold`, `random_id`, `message_id`),
+INFO `inbound message in manual dialog` (without it, WARN `inbound message not
+matched`, a real defect). ERROR requires a human: an account restriction,
+inability to authorize, an undelivered database write, `direct message
+stuck pending` at start. An ordinary per-addressee failure is a WARN and a
+report line.
 
-`status`: расход потолка числом (`usedTodaySQL`), разбивка «из них первых
-касаний руками: N», тёплые отдельно (не ограничены потолком); потолок взят из
-БД (расхождение с `ACCOUNT_DAILY_LIMIT` даёт WARN при старте); два счётчика -
-зависшие касания (`StuckDirect`) и строки с протухшим `claim`.
+`status`: cap spending as a number (`usedTodaySQL`), a breakdown "of which
+first touches by hand: N", warm touches separately (not limited by the cap);
+the cap is taken from the DB (a mismatch with `ACCOUNT_DAILY_LIMIT` gives a
+WARN at start); two counters: stuck touches (`StuckDirect`) and rows with an
+expired `claim`.
 
-Активный стоп наблюдаем тремя путями: ERROR в логе, красный healthcheck (503
-на `/health`), `status` утром и вечером.
+An active stop is observable in three ways: an ERROR in the log, a red
+healthcheck (503 on `/health`), and `status` in the morning and evening.
 
-## Side effects и идемпотентность
+## Side effects and idempotency
 
-Действие наружу одно: отправка в Telegram - кампанией или руками.
+There is one outward action: sending to Telegram, by campaign or by hand.
 
-Очередь в базе, claim-модель: транзакция под блокировкой строки аккаунта
-проверяет рубежи и берёт строку (`FOR UPDATE SKIP LOCKED`), сетевой вызов
-строго между транзакциями, финализация отдельной транзакцией; протухший claim
-возвращается в выборку. Идемпотентность - `RandomID`: повтор строки не создаёт
-второго сообщения (`RANDOM_ID_DUPLICATE` = успех). Временный отказ возвращает
-строку в очередь, бюджет попыток 5. Отказ-ограничение аккаунта не ретраится -
-поднимает стоп.
+The queue is in the database with a claim model: a transaction under a lock on
+the account row checks the boundaries and takes a row (`FOR UPDATE SKIP
+LOCKED`), the network call happens strictly between transactions, and
+finalization is a separate transaction; an expired claim returns to the
+selection. Idempotency is `RandomID`: a retry of a row does not create a second
+message (`RANDOM_ID_DUPLICATE` counts as success). A temporary failure returns
+the row to the queue, with a budget of 5 attempts. An account-restriction
+failure is not retried; it raises the stop.
 
-Ручное касание - тот же порядок, но `random_id` свежий на каждый вызов (живой
-диалог полон одинаковых реплик, стабильный id проглотил бы их как дубль); от
-повтора вызова защищает проверка `pending`-строки, не `random_id`.
+A manual touch follows the same order, but `random_id` is fresh on every call
+(a live dialog is full of identical replies, and a stable id would swallow them
+as a duplicate); a repeated call is guarded by the `pending` row check, not by
+`random_id`.
 
-Ручная отправка берёт ту же блокировку строки аккаунта, что claim очереди.
-Гард на гонку: сообщение не уходит человеку, чью строку кампания брала в
-работу (`account_id`, ставит только claim); считает кампании
-`active`/`stopped`/`draft`, живой claim блокирует при любом статусе.
+A manual send takes the same account-row lock as the queue claim. Race guard:
+a message does not go to a person whose row a campaign took into work
+(`account_id`, set only by the claim); campaigns in `active`, `stopped` and
+`draft` are counted, and a live claim blocks in any status.
 
-## Внешние границы
+## External boundaries
 
-**Telegram MTProto.** Отправка текста, резолв ника, поиск человека (точный ник
-- отдельным запросом), история диалога, список диалогов.
+**Telegram MTProto.** Sending text, username resolve, finding a person (an exact
+username is a separate request), dialog history, dialog list.
 
-`messages.getDialogs` - единственное место, где сервис видит не только людей:
-человек, группа, канал одним ответом, вид назван по смыслу действия (человек -
-можно написать, группа - читать переписку, канал - поток постов; супергруппа
-для читателя = группа). Рубежи отправки не тронуты: `ResolveUsername`
-отвергает всё, кроме `PeerUser`. Канал/супергруппа из списка ложатся в
-хранилище адресатов с access hash (задел под чтение истории групп, M7 срез 2).
+`messages.getDialogs` is the only place where the service sees more than
+people: a person, a group and a channel in one reply, with the kind named by
+what you can do (person: you can write; group: read the correspondence;
+channel: a stream of posts; a supergroup counts as a group for the reader).
+The send boundaries are untouched: `ResolveUsername` rejects everything except
+`PeerUser`. A channel or supergroup from the list is stored in the addressee
+storage with its access hash (groundwork for reading group history, M7 slice 2).
 
-Сорванный резолв точного ника - WARN, не выдаётся за ответ (`tg_find` при
-пустом нечётком поиске отдаёт причину срыва, не «никого не нашлось»).
+A failed resolve of an exact username is a WARN and is not passed off as an
+answer (when fuzzy search is empty, `tg_find` returns the failure reason, not
+"nobody found").
 
-Отказы - закрытый список из десяти видов (`internal/telegram/errors.go`):
-клиент не готов, просьба переждать, ограничение на письма незнакомым, запрет
-писать адресату, ник занят группой/каналом, отвергнутое вложение, потерянная
-авторизация, кривой запрос, отказ своего хранилища адресатов, прочее
-временное. Рядом - код ошибки MTProto (`FLOOD_WAIT`, `MSG_ID_INVALID`).
-Ограничение принадлежит аккаунту, не вызову: `PEER_FLOOD`, длинный
-`FLOOD_WAIT`, отозванная сессия останавливают аккаунт целиком. Стоп не
-снимается по таймеру: `resume_account` - для ограничения Telegram, `authorize`
-(`docs/first-launch.md`) - для отозванной сессии. Переждать - только у
-короткого `FLOOD_WAIT`.
+Failures are a closed list of ten kinds (`internal/telegram/errors.go`): client
+not ready, a request to wait, restriction on messages to strangers, a ban on
+writing to the addressee, username taken by a group or channel, a rejected
+attachment, lost authorization, a malformed request, a failure of the own
+addressee storage, other temporary. Next to the kind is the MTProto error code
+(`FLOOD_WAIT`, `MSG_ID_INVALID`). A restriction belongs to the account, not to
+the call: `PEER_FLOOD`, a long `FLOOD_WAIT` and a revoked session stop the
+whole account. The stop is not lifted by a timer: `resume_account` is for a
+Telegram restriction, `authorize` (`docs/first-launch.md`) is for a revoked
+session. Only a short `FLOOD_WAIT` is waited out.
 
 **MCP.** `modelcontextprotocol/go-sdk` (v1): streamable HTTP,
-`auth.RequireBearerToken`. Аргументы под ~8 КБ (баги Claude Code с большими
-tool-аргументами) - отсюда пачки получателей. Ожидание реплики в `tg_read` -
-45 секунд (60+ падали по таймауту у клиента). Мутации подтверждаются штатным
-механизмом разрешений Клода. Эндпоинт - один экземпляр (`MCP_ENABLED`),
-процесс привязан к аккаунту (`ACCOUNT_LABEL`).
+`auth.RequireBearerToken`. Arguments stay under ~8 KB (Claude Code bugs with
+large tool arguments), hence the recipient batches. Waiting for a reply in
+`tg_read` is 45 seconds (60+ timed out on the client). Mutations are confirmed
+by Claude's standard permission mechanism. The endpoint is one instance
+(`MCP_ENABLED`), and the process is bound to an account (`ACCOUNT_LABEL`).
 
-**Источники списков.** Не обращается вовсе (ни CRM, ни файлов, ни чужих баз) -
-единственный вход `add_recipients`; знание об устройстве данных - в `campaigns`.
+**List sources.** The service calls none at all (no CRM, no files, no foreign
+databases); the only input is `add_recipients`. Knowledge of the data layout
+lives in `campaigns`.
 
-## Контуры и конфигурация
+## Environments and configuration
 
-Контур один и боевой, на машине владельца. Транспорт: `dry-run` пишет в лог, не
-ходит наружу; `live` через MTProto, вне `ENV=prod` не поднимается.
+There is one environment, and it is the production one, on the owner's machine.
+Transport: `dry-run` writes to the log and does not go outside; `live` goes
+through MTProto and does not start outside `ENV=prod`.
 
-`DEV_ALLOW_LIST` - последний рубеж перед выходом наружу, только при `ENV=dev`;
-в `prod` не поднимается. Держит только отправку, не чтение (решение, не
-упущение): резолв для чтения (`Lookup`) отдельно от резолва для отправки
-(`Resolve`) - иначе с непустым allow-list нельзя прочитать диалог с тем, кому
-уже нельзя писать.
+`DEV_ALLOW_LIST` is the last boundary before going outside, only with
+`ENV=dev`; it does not start in `prod`. It restricts only sending, not reading
+(a decision, not an omission): the resolve for reading (`Lookup`) is separate
+from the resolve for sending (`Resolve`), otherwise with a non-empty allow-list
+you could not read a dialog with someone you can no longer write to.
 
-В настройке, не в коде: дневной потолок аккаунта, границы паузы, окно
-отправки, порог FLOOD_WAIT, режим транспорта (проверенных цифр темпа нет).
-Потолок настройкой только заводится, действующее число - в `accounts`, меняют
-в БД (`runbook-account.md`).
+Set in configuration, not in code: the account daily cap, pause bounds, send
+window, FLOOD_WAIT threshold, transport mode (there are no verified pace
+figures). The cap is only seeded by configuration; the effective number is in
+`accounts` and is changed in the DB (`runbook-account.md`).
 
-Пауза между витками (дефолт 10-30 минут) - весь такт отправщика: 20 писем = 19
-пауз, ~6ч20м против 9 часов окна; предельный случай (все по 30 минут) не
-влезает - остаток уходит на следующий будний день.
+The pause between sender cycles (default 10-30 minutes) is the whole sender
+tick: 20 messages = 19 pauses, ~6h20m against a 9-hour window; the extreme case
+(all at 30 minutes) does not fit, and the remainder goes to the next weekday.
 
-## Инварианты
+## Invariants
 
-| Инвариант | Где обеспечен |
+| Invariant | Where it is enforced |
 | --- | --- |
-| Один человек - одно сообщение, включая прошлые кампании и ручные касания | уникальность «кампания-контакт»; журнал касаний в отсеве и claim; повтор при отправке |
-| Окно и потолок держат рассылку и первое касание незнакомца | проверка в транзакции отправки, счёт по БД; тёплая реплика не подчиняется намеренно |
-| Ограничение аккаунта останавливает только его | стоп на уровне аккаунта |
-| Стоп не снимается по таймеру | снятие только инструментом, командой человека |
-| Стоп-лист закрыт и для ручной отправки | проверка по нику и по контакту amoCRM |
-| Без пригодного ника, а под `{имя}` со скобкой - человек в отправку не идёт | отсев импорта + повтор на взятой строке очереди; длина - проверкой на взятой строке |
-| Письмо с неразобранной скобкой не уходит | проверка в `load_campaign`/`AddRecipients`/`StartCampaign`; `ClaimNext` не отдаёт строку |
-| Сервис не обращается к внешним источникам списков | в сервисе нет клиента к ним (ревью, пройдено дважды) |
+| One person, one message, including past campaigns and manual touches | uniqueness of the campaign-contact pair; touch journal in the filter and claim; retry on send |
+| The window and the cap hold both the campaign and a first touch to a stranger | check in the send transaction, counted from the DB; a warm reply is deliberately exempt |
+| An account restriction stops only that account | stop at the account level |
+| The stop is not lifted by a timer | lifted only by a tool, on a human command |
+| The stop list is closed for manual sending too | check by username and by amoCRM contact |
+| Without a usable username, and under `{имя}` with a brace, a person does not go to sending | import filter plus a repeat on the row taken from the queue; length is checked on the taken row |
+| A message with an unparsed brace does not go out | check in `load_campaign`/`AddRecipients`/`StartCampaign`; `ClaimNext` returns no row |
+| The service does not call external list sources | there is no client for them in the service (reviewed, passed twice) |
 
-## Решения
+## Decisions
 
-Главные решения:
+Main decisions:
 
-Отдельный сервис (не функция квалификатора, чтобы стоп по флуду не гасил
-входящих лидов); несколько аккаунтов - несколько экземпляров с общей очередью
-(одна сессия MTProto на процесс); текст - шаблон плюс `{имя}`, без свободного
-рерайта; отбор сегмента вне сервиса (`campaigns`); без Telegram-бота,
-управление - MCP; резолв по номеру выключен по умолчанию; один аккаунт на
-рассылку и диалоги, рубеж - журнал касаний, а не роль аккаунта; рубеж на
-холодном контакте, не на инструменте; журнал ложится до сетевого вызова;
-ключ журнала - ник (изменяемый, принятое ограничение); ожидание реплики -
-опрос истории, не подписка на апдейты gotd.
+A separate service (not a function of the lead-handling system, so that a flood stop does
+not silence inbound leads); several accounts mean several instances with a
+shared queue (one MTProto session per process); the text is a template plus
+`{имя}`, without free rewriting; segment selection outside the service
+(`campaigns`); no Telegram bot, management is MCP; resolve by phone number is
+off by default; one account for campaigns and dialogs, and the boundary is the
+touch journal, not the account role; the boundary is on a cold contact, not on
+a tool; the journal is written before the network call; the journal key is the
+username (mutable, an accepted limitation); waiting for a reply is history
+polling, not a subscription to gotd updates.
 
-## Ограничения и открытое
+## Limitations and open items
 
-- Не встречались живьём: закрытая личка, отказ резолва, ограничение аккаунта -
-  поведение держится на тестах.
-- Строка `planned` в отменённой кампании при смерти процесса внутри окна
-  протухания claim ждёт ручного сметания.
-- Строка журнала, зависшая в `pending`, закрывает человека навсегда (у claim
-  очереди есть второй шанс, у журнала нет). Видна счётчиком в `status`,
-  ERROR при старте; починка - SQL руками.
-- Группы и каналы видны только списком диалогов: историю инструменты не
-  читают, `tg_find` их не ищет, отправка невозможна. Чтение истории -
-  следующий срез (M7 срез 2). Вложения не скачиваются и не отправляются.
-- Ответ человека закрывает строку (`replied`), но уведомлений об ответах нет -
-  личку читает человек. При двух и более аккаунтах вопрос вернётся.
+- Not encountered live: a closed DM, a resolve failure, an account
+  restriction; behavior rests on tests.
+- A `planned` row in a cancelled campaign, if the process dies within the claim
+  expiry window, waits for a manual sweep.
+- A journal row stuck in `pending` closes the person forever (the queue claim
+  has a second chance, the journal does not). It is visible as a counter in
+  `status` and an ERROR at start; the fix is SQL by hand.
+- Groups and channels are visible only through the dialog list: the tools do
+  not read their history, `tg_find` does not search for them, and sending is
+  impossible. Reading history is the next slice (M7 slice 2). Attachments are
+  neither downloaded nor sent.
+- A person's reply closes the row (`replied`), but there are no notifications
+  about replies; a human reads the DM. With two or more accounts the question
+  returns.
