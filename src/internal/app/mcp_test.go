@@ -14,13 +14,13 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/telegram"
 )
 
-// toolText прогоняет обработчик инструмента и отдаёт текст ответа. Полный
-// HTTP-транспорт здесь не нужен: проверяется решение инструмента, а не
-// streamable-обвязка сервера.
+// toolText runs a tool handler and returns the answer text. The full HTTP
+// transport is not needed here: the tool's decision is under test, not the
+// streamable plumbing of the server.
 func toolText(t *testing.T, result *mcp.CallToolResult, err error) string {
 	t.Helper()
 	if err != nil {
-		t.Fatalf("инструмент отказал: %v", err)
+		t.Fatalf("tool refused: %v", err)
 	}
 	var text strings.Builder
 	for _, content := range result.Content {
@@ -31,20 +31,20 @@ func toolText(t *testing.T, result *mcp.CallToolResult, err error) string {
 	return text.String()
 }
 
-// Инструменты кампании id не принимают: add_recipients работает с единственным
-// черновиком, а без черновика обязан внятно сказать, чего не хватает.
+// The campaign tools take no id: add_recipients works with the single draft,
+// and without a draft it must say plainly what is missing.
 func TestAddRecipientsUsesSingleDraft(t *testing.T) {
 	handlers := &tools{service: newService(t)}
 	ctx := context.Background()
 
 	if _, _, err := handlers.addRecipients(ctx, nil, addArgs{People: []personArgs{{ContactID: 1, Username: "ivan_petrov"}}}); err == nil {
-		t.Fatal("пачка принята без черновика")
+		t.Fatal("batch accepted without a draft")
 	} else if !strings.Contains(err.Error(), "load_campaign") {
-		t.Fatalf("отказ без черновика не называет следующий шаг: %v", err)
+		t.Fatalf("refusal without a draft does not name the next step: %v", err)
 	}
 
 	if _, _, err := handlers.loadCampaign(ctx, nil, loadArgs{Template: "Привет, {имя}!", Title: "тест"}); err != nil {
-		t.Fatalf("создать черновик: %v", err)
+		t.Fatalf("create draft: %v", err)
 	}
 
 	result, _, err := handlers.addRecipients(ctx, nil, addArgs{People: []personArgs{
@@ -54,20 +54,21 @@ func TestAddRecipientsUsesSingleDraft(t *testing.T) {
 	}})
 	text := toolText(t, result, err)
 
-	if !strings.Contains(text, "Принято: 1 из 3") {
-		t.Fatalf("отчёт не называет число принятых:\n%s", text)
+	if !strings.Contains(text, "Accepted: 1 of 3") {
+		t.Fatalf("report does not name the accepted count:\n%s", text)
 	}
 	if !strings.Contains(text, reasonLabels[ReasonNoUsername]) || !strings.Contains(text, reasonLabels[ReasonDuplicate]) {
-		t.Fatalf("отчёт не называет причины отсева:\n%s", text)
+		t.Fatalf("report does not name the screening reasons:\n%s", text)
 	}
 	if !strings.Contains(text, "Привет, Иван!") {
-		t.Fatalf("в отчёте нет превью сообщения:\n%s", text)
+		t.Fatalf("report has no message preview:\n%s", text)
 	}
 }
 
-// Черновик рядом с идущей кампанией: add_recipients отчитывается по черновику,
-// в который вставлял, а status - по активной, назвав черновик отдельной
-// строкой. Иначе сверка списка перед стартом шла бы по чужой кампании.
+// A draft next to a running campaign: add_recipients reports on the draft it
+// inserted into, while status reports on the active campaign and names the
+// draft on a separate line. Otherwise checking the list before start would go
+// by another campaign.
 func TestReportsFollowTheEditedCampaign(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service}
@@ -75,7 +76,7 @@ func TestReportsFollowTheEditedCampaign(t *testing.T) {
 
 	startWith(t, service, person(1, "active_one"))
 	if _, _, err := handlers.loadCampaign(ctx, nil, loadArgs{Template: "Черновик, {имя}!", Title: "второй"}); err != nil {
-		t.Fatalf("создать черновик: %v", err)
+		t.Fatalf("create draft: %v", err)
 	}
 
 	result, _, err := handlers.addRecipients(ctx, nil, addArgs{
@@ -83,46 +84,48 @@ func TestReportsFollowTheEditedCampaign(t *testing.T) {
 	})
 	added := toolText(t, result, err)
 	if !strings.Contains(added, "второй") || !strings.Contains(added, "Черновик, Пётр!") {
-		t.Fatalf("отчёт вставки не по черновику:\n%s", added)
+		t.Fatalf("insert report is not about the draft:\n%s", added)
 	}
 	if strings.Contains(added, "active_one") {
-		t.Fatalf("в отчёте вставки превью чужой кампании:\n%s", added)
+		t.Fatalf("insert report has another campaign's preview:\n%s", added)
 	}
 
 	statusResult, _, err := handlers.status(ctx, nil, statusArgs{})
 	shown := toolText(t, statusResult, err)
 	if !strings.Contains(shown, "Привет, Иван!") {
-		t.Fatalf("status показывает не активную кампанию:\n%s", shown)
+		t.Fatalf("status does not show the active campaign:\n%s", shown)
 	}
-	if !strings.Contains(shown, "Есть черновик") {
-		t.Fatalf("status не назвал черновик:\n%s", shown)
+	if !strings.Contains(shown, "There is a draft") {
+		t.Fatalf("status did not name the draft:\n%s", shown)
 	}
 }
 
-// Повторный stop на уже приостановленной кампании: кампания жива, и отказ обязан
-// назвать паузу и продолжение через start, а не советовать создать черновик.
+// A repeated stop on an already paused campaign: the campaign is alive, and the
+// refusal must name the pause and the resume through start, not advise creating
+// a draft.
 func TestStopAgainNamesThePause(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
 
 	startWith(t, service, person(1, "first_one"))
 	if _, err := service.StopCampaign(ctx, false); err != nil {
-		t.Fatalf("пауза: %v", err)
+		t.Fatalf("pause: %v", err)
 	}
 
 	handlers := &tools{service: service}
 	_, _, err := handlers.stop(ctx, nil, stopArgs{})
 	if err == nil {
-		t.Fatal("повторная пауза принята как остановка")
+		t.Fatal("repeated pause accepted as a stop")
 	}
-	if !strings.Contains(err.Error(), "уже на паузе") || !strings.Contains(err.Error(), "start") {
-		t.Fatalf("отказ не назвал живую паузу: %v", err)
+	if !strings.Contains(err.Error(), "already paused") || !strings.Contains(err.Error(), "start") {
+		t.Fatalf("refusal did not name the live pause: %v", err)
 	}
 }
 
-// Тот же отказ при паре «пауза плюс черновик»: start возьмёт черновик, и cancel
-// снимет черновик, поэтому совет «продолжите паузу через start» отправил бы
-// агента запускать чужую кампанию, а «снимите cancel» - сносить собранный список.
+// The same refusal for a "pause plus draft" pair: start will take the draft and
+// cancel will remove the draft, so the advice "resume the pause with start"
+// would send the agent to start another campaign, and "remove with cancel" to
+// wipe the collected list.
 func TestStopRefusalCountsTheDraft(t *testing.T) {
 	service := newService(t)
 	paused, draft := pausedAndDraft(t, service)
@@ -130,20 +133,21 @@ func TestStopRefusalCountsTheDraft(t *testing.T) {
 	handlers := &tools{service: service}
 	_, _, err := handlers.stop(context.Background(), nil, stopArgs{})
 	if err == nil {
-		t.Fatal("повторная пауза принята как остановка")
+		t.Fatal("repeated pause accepted as a stop")
 	}
 	text := err.Error()
-	if !strings.Contains(text, fmt.Sprintf("черновик %d", draft)) {
-		t.Fatalf("отказ не назвал черновик рядом с паузой %d: %v", paused, err)
+	if !strings.Contains(text, fmt.Sprintf("draft %d", draft)) {
+		t.Fatalf("refusal did not name the draft next to pause %d: %v", paused, err)
 	}
-	if !strings.Contains(text, "start запустит черновик") || !strings.Contains(text, "cancel снимет черновик") {
-		t.Fatalf("отказ обещает действия по паузе, а они пойдут по черновику: %v", err)
+	if !strings.Contains(text, "start will launch the draft") || !strings.Contains(text, "stop with cancel will cancel the draft") {
+		t.Fatalf("refusal promises actions on the pause, but they will act on the draft: %v", err)
 	}
 }
 
-// Простой очереди называется в status: кампания остаётся active, строки стоят в
-// очереди, и без этой строки причина видна только косвенно. Проверяются те две
-// причины, которых не хватило на живом тесте, - потолок и закрытое окно.
+// A queue idle is named in status: the campaign stays active, the rows stand in
+// the queue, and without this line the reason is visible only indirectly. The
+// two reasons that a live test did not cover are checked - the cap and the
+// closed window.
 func TestStatusNamesIdleReason(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service}
@@ -152,32 +156,33 @@ func TestStatusNamesIdleReason(t *testing.T) {
 	startWith(t, service, person(1, "ivan_petrov"), person(2, "petr_ivanov"))
 	claimed, err := service.ClaimNext(ctx, "test")
 	if err != nil || claimed == nil {
-		t.Fatalf("взять строку: %v, %+v", err, claimed)
+		t.Fatalf("claim a row: %v, %+v", err, claimed)
 	}
 	if _, err := service.FinishClaim(ctx, claimed, ResultSent, ""); err != nil {
-		t.Fatalf("финализация: %v", err)
+		t.Fatalf("finalize: %v", err)
 	}
 	runSQL(t, service, `UPDATE accounts SET daily_limit = 1 WHERE label = 'test'`)
 
 	result, _, err := handlers.status(ctx, nil, statusArgs{})
 	text := toolText(t, result, err)
-	if !strings.Contains(text, "дневной потолок аккаунта израсходован (1 из 1)") {
-		t.Fatalf("status не назвал простой по потолку:\n%s", text)
+	if !strings.Contains(text, "the account's daily cap is used up (1 of 1)") {
+		t.Fatalf("status did not name the idle by the cap:\n%s", text)
 	}
 
-	// Суббота той же недели: окно закрыто и перекрывает потолок, а открытие
-	// названо часом, иначе «ждите окна» не говорит, до каких пор.
+	// Saturday of the same week: the window is closed and overrides the cap, and
+	// the opening is named by the hour, otherwise "wait for the window" does not
+	// say until when.
 	service.Now = func() time.Time { return testNow.AddDate(0, 0, 3) }
 	result, _, err = handlers.status(ctx, nil, statusArgs{})
 	text = toolText(t, result, err)
-	if !strings.Contains(text, "окно отправки закрыто, ближайшее открытие 07.09 10:00 МСК") {
-		t.Fatalf("status не назвал простой по окну:\n%s", text)
+	if !strings.Contains(text, "the send window is closed, next opening 07.09 10:00 MSK") {
+		t.Fatalf("status did not name the idle by the window:\n%s", text)
 	}
 }
 
-// Расход на служебных адресатов владельца называется в status отдельной
-// строкой, тем же приёмом, что и тёплые ответы: в потолок он не входит, и без
-// этой строки его не видно вовсе.
+// Spending on the owner's service recipients is named in status on a separate
+// line, the same way as warm replies: it does not count toward the cap, and
+// without this line it is not visible at all.
 func TestStatusNamesOwnerSpending(t *testing.T) {
 	service := newService(t, "smirnov")
 	handlers := &tools{service: service}
@@ -186,56 +191,58 @@ func TestStatusNamesOwnerSpending(t *testing.T) {
 	startWith(t, service, person(1, "smirnov"))
 	claimed, err := service.ClaimNext(ctx, "test")
 	if err != nil || claimed == nil {
-		t.Fatalf("взять строку служебного адресата: %v, %+v", err, claimed)
+		t.Fatalf("claim the service recipient's row: %v, %+v", err, claimed)
 	}
 	if _, err := service.FinishClaim(ctx, claimed, ResultSent, ""); err != nil {
-		t.Fatalf("финализация: %v", err)
+		t.Fatalf("finalize: %v", err)
 	}
 
 	result, _, err := handlers.status(ctx, nil, statusArgs{})
 	text := toolText(t, result, err)
-	if !strings.Contains(text, "служебных адресатов сегодня: 1 (в потолок не входят)") {
-		t.Fatalf("status не назвал расход на служебных адресатов:\n%s", text)
+	if !strings.Contains(text, "service recipients today: 1 (not counted toward the cap)") {
+		t.Fatalf("status did not name the spending on service recipients:\n%s", text)
 	}
-	// Состав списка называется поимённо: снятый рубеж, о котором никто не узнал,
-	// равен его отсутствию, а лишний ник в DEV_ALLOW_LIST виден только здесь.
-	if !strings.Contains(text, "Служебные адресаты (окно, потолок и правило «одно сообщение» на них не действуют): @smirnov") {
-		t.Fatalf("status не назвал состав служебных адресатов:\n%s", text)
+	// The membership of the list is named by username: a lifted guard that nobody
+	// heard about equals its absence, and an extra username in DEV_ALLOW_LIST is
+	// visible only here.
+	if !strings.Contains(text, "Service recipients (the window, the cap and the one-message rule do not apply to them): @smirnov") {
+		t.Fatalf("status did not name the membership of the service recipients:\n%s", text)
 	}
 }
 
-// resume_account отвечает по факту: снятый стоп назван причиной, живой аккаунт -
-// прямо, незнакомая метка - отказом. Ответ «стоп снят» там, где стопа не было,
-// отправляет человека чинить несуществующую поломку.
+// resume_account answers by the facts: a cleared stop is named with its reason,
+// a live account plainly, an unknown label with a refusal. The answer "stop
+// cleared" where there was no stop sends a person to fix a breakage that does
+// not exist.
 func TestResumeAccountAnswersByState(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service}
 	ctx := context.Background()
 
 	quiet, _, err := handlers.resumeAccount(ctx, nil, resumeArgs{Label: "test"})
-	if text := toolText(t, quiet, err); !strings.Contains(text, `Стопа на аккаунте "test" нет: снимать нечего`) {
-		t.Fatalf("живой аккаунт отвечает как снятый стоп:\n%s", text)
+	if text := toolText(t, quiet, err); !strings.Contains(text, `Account "test" has no stop: nothing to clear`) {
+		t.Fatalf("a live account answers as if a stop was cleared:\n%s", text)
 	}
 
 	if err := service.StopAccount(ctx, "test", telegram.KindPeerFlood); err != nil {
-		t.Fatalf("остановить аккаунт: %v", err)
+		t.Fatalf("stop the account: %v", err)
 	}
 	result, _, err := handlers.resumeAccount(ctx, nil, resumeArgs{Label: "test"})
 	text := toolText(t, result, err)
-	if !strings.Contains(text, `Стоп с аккаунта "test" снят`) || !strings.Contains(text, telegram.KindPeerFlood) {
-		t.Fatalf("снятие стопа не названо причиной:\n%s", text)
+	if !strings.Contains(text, `Stop cleared on account "test"`) || !strings.Contains(text, telegram.KindPeerFlood) {
+		t.Fatalf("clearing the stop is not named with its reason:\n%s", text)
 	}
 	if stopped, _, err := service.AccountStopped(ctx, "test"); err != nil || stopped {
-		t.Fatalf("стоп не снят: %v, %v", stopped, err)
+		t.Fatalf("stop not cleared: %v, %v", stopped, err)
 	}
 
 	if _, _, err := handlers.resumeAccount(ctx, nil, resumeArgs{Label: "unknown"}); err == nil {
-		t.Fatal("метка без аккаунта принята как снятый стоп")
+		t.Fatal("a label with no account accepted as a cleared stop")
 	}
 }
 
-// Превью показывает не больше трёх строк: заголовок обязан назвать, сколько их в
-// кампании, иначе три строки читаются как весь список.
+// The preview shows no more than three rows: the header must name how many the
+// campaign has, otherwise three rows read as the whole list.
 func TestPreviewNamesItsLimit(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service}
@@ -246,13 +253,13 @@ func TestPreviewNamesItsLimit(t *testing.T) {
 
 	result, _, err := handlers.status(context.Background(), nil, statusArgs{})
 	text := toolText(t, result, err)
-	if !strings.Contains(text, "Превью сообщений (первые 3 из 4):") {
-		t.Fatalf("превью не называет потолок показа:\n%s", text)
+	if !strings.Contains(text, "Message preview (first 3 of 4):") {
+		t.Fatalf("preview does not name its display cap:\n%s", text)
 	}
 }
 
-// failDialog - транспорт, у которого чтение отказывает: отказ живого Telegram
-// приходит на резолве, а stubDialog умеет ронять только отправку.
+// failDialog is a transport whose read fails: the live Telegram refusal comes
+// at resolve, while stubDialog can only fail a send.
 type failDialog struct {
 	stubDialog
 	err error
@@ -260,8 +267,8 @@ type failDialog struct {
 
 func (d *failDialog) Lookup(context.Context, string) (Peer, error) { return Peer{}, d.err }
 
-// Регистрация - единственное, что отличает написанный обработчик от
-// доступного агенту: инструмент вне списка сервера не существует.
+// Registration is the only thing that separates a written handler from one
+// available to the agent: a tool outside the server's list does not exist.
 func TestDialogToolsRegistered(t *testing.T) {
 	ctx := context.Background()
 	serverSide, clientSide := mcp.NewInMemoryTransports()
@@ -269,19 +276,19 @@ func TestDialogToolsRegistered(t *testing.T) {
 	server := NewMCPServer(&Service{cfg: Config{AccountLabel: "test"}, Now: time.Now}, nil)
 	serverSession, err := server.Connect(ctx, serverSide, nil)
 	if err != nil {
-		t.Fatalf("поднять сервер: %v", err)
+		t.Fatalf("start the server: %v", err)
 	}
 	defer func() { _ = serverSession.Close() }()
 
 	session, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1.0.0"}, nil).Connect(ctx, clientSide, nil)
 	if err != nil {
-		t.Fatalf("подключиться: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
 	defer func() { _ = session.Close() }()
 
 	list, err := session.ListTools(ctx, nil)
 	if err != nil {
-		t.Fatalf("список инструментов: %v", err)
+		t.Fatalf("list tools: %v", err)
 	}
 	registered := map[string]bool{}
 	for _, tool := range list.Tools {
@@ -289,15 +296,16 @@ func TestDialogToolsRegistered(t *testing.T) {
 	}
 	for _, name := range []string{"tg_find", "tg_send", "tg_read", "tg_dialogs"} {
 		if !registered[name] {
-			t.Fatalf("инструмент %s не зарегистрирован: %v", name, registered)
+			t.Fatalf("tool %s is not registered: %v", name, registered)
 		}
 	}
 }
 
-// Аргументы status и stop необязательны, и схема обязана это говорить: поле без
-// omitempty объявляется required, и вызов без аргументов отбивается проверкой
-// схемы, не дойдя до обработчика. Живой status отвечал так на пустой объект.
-// Проверка накрывает и campaign_id: у int64 та же болезнь, что у флага.
+// The arguments of status and stop are optional, and the schema must say so: a
+// field without omitempty is declared required, and a call with no arguments is
+// rejected by schema validation before it reaches the handler. The live status
+// answered that way to an empty object. The check covers campaign_id too: an
+// int64 has the same problem as a flag.
 func TestOptionalFlagsAreNotRequired(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -305,44 +313,47 @@ func TestOptionalFlagsAreNotRequired(t *testing.T) {
 
 	serverSession, err := NewMCPServer(service, nil).Connect(ctx, serverSide, nil)
 	if err != nil {
-		t.Fatalf("поднять сервер: %v", err)
+		t.Fatalf("start the server: %v", err)
 	}
 	defer func() { _ = serverSession.Close() }()
 
 	session, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1.0.0"}, nil).Connect(ctx, clientSide, nil)
 	if err != nil {
-		t.Fatalf("подключиться: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
 	defer func() { _ = session.Close() }()
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "status"})
 	if err != nil {
-		t.Fatalf("status без аргументов отказал: %v", err)
+		t.Fatalf("status without arguments failed: %v", err)
 	}
 	if text := toolText(t, result, nil); result.IsError {
-		t.Fatalf("status без аргументов отвечает отказом:\n%s", text)
+		t.Fatalf("status without arguments answers with a refusal:\n%s", text)
 	}
 
-	// stop без кампании отказывает по делу; проверяется, что отказ доменный, а не
-	// схемы: у флага cancel та же болезнь и то же лечение.
+	// stop without a campaign refuses on the merits; the check is that the
+	// refusal is a domain one, not a schema one: the cancel flag has the same
+	// problem and the same cure.
 	stopped, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "stop"})
 	if err != nil {
-		t.Fatalf("stop без аргументов отказал: %v", err)
+		t.Fatalf("stop without arguments failed: %v", err)
 	}
 	if text := toolText(t, stopped, nil); strings.Contains(text, "validating") {
-		t.Fatalf("stop без аргументов отбит схемой:\n%s", text)
+		t.Fatalf("stop without arguments rejected by the schema:\n%s", text)
 	}
 }
 
-// Срез по умолчанию - самый частый вызов, и молчит он опаснее явного: двадцать
-// первых строк агент читает как весь список и делает вывод «человека нет».
+// The default cut is the most common call, and its silence is more dangerous
+// than an explicit one: the agent reads the first twenty rows as the whole list
+// and concludes "the person is not there".
 func TestToolsNameTheirCut(t *testing.T) {
 	ctx := context.Background()
 
-	// Ровно defaultHistory штук: срез до limit теперь держит транспорт (проверено
-	// в internal/telegram), а Chat.Dialogs отдаёт его выборку как есть, без
-	// второго обрезания. Подставной транспорт своим limit не пользуется, поэтому
-	// список собирается уже нужного размера - так же, как его отдал бы настоящий.
+	// Exactly defaultHistory items: the cut to limit is now held by the transport
+	// (checked in internal/telegram), and Chat.Dialogs returns its selection as
+	// is, without a second trim. The stand-in transport does not use its limit,
+	// so the list is built already of the right size - the way a real one would
+	// return it.
 	crowd := make([]DialogInfo, 0, defaultHistory)
 	for i := range defaultHistory {
 		crowd = append(crowd, DialogInfo{
@@ -359,76 +370,77 @@ func TestToolsNameTheirCut(t *testing.T) {
 
 	result, _, err := handlers.dialogs(ctx, nil, dialogsArgs{})
 	listed := toolText(t, result, err)
-	if !strings.Contains(listed, "Показано 20 последних диалогов") || !strings.Contains(listed, "limit до 100") {
-		t.Fatalf("список диалогов не назвал срез по умолчанию:\n%s", listed)
+	if !strings.Contains(listed, "Showing the 20 most recent dialogs") || !strings.Contains(listed, "limit up to 100") {
+		t.Fatalf("the dialog list did not name the default cut:\n%s", listed)
 	}
-	if !strings.Contains(listed, "Диалоги (20)") {
-		t.Fatalf("срез по умолчанию не применён:\n%s", listed)
+	if !strings.Contains(listed, "Dialogs (20)") {
+		t.Fatalf("default cut not applied:\n%s", listed)
 	}
 
 	deep, _, err := handlers.read(ctx, nil, readArgs{Username: "ivan_petrov"})
-	if shown := toolText(t, deep, err); !strings.Contains(shown, "Показано не всё") {
-		t.Fatalf("чтение диалога не назвало исчерпанную глубину:\n%s", shown)
+	if shown := toolText(t, deep, err); !strings.Contains(shown, "Not everything is shown") {
+		t.Fatalf("the dialog read did not name the exhausted depth:\n%s", shown)
 	}
 
-	// Список короче предела показан целиком: и оговорка про срез, и совет звать
-	// tg_dialogs с большим limit отправили бы агента за несуществующим остатком.
+	// A list shorter than the limit is shown in full: both the caveat about the
+	// cut and the advice to call tg_dialogs with a larger limit would send the
+	// agent after a remainder that does not exist.
 	few := liveTools(&stubDialog{dialogs: crowd[:3]})
 	shortList, _, err := few.dialogs(ctx, nil, dialogsArgs{})
-	if shown := toolText(t, shortList, err); strings.Contains(shown, "последних диалогов") || strings.Contains(shown, "limit до 100") {
-		t.Fatalf("полный список диалогов назван срезом:\n%s", shown)
+	if shown := toolText(t, shortList, err); strings.Contains(shown, "most recent dialogs") || strings.Contains(shown, "limit up to 100") {
+		t.Fatalf("a full dialog list is named a cut:\n%s", shown)
 	}
 
-	// Диалог короче глубины показан целиком: оговорка тут отправила бы агента за
-	// несуществующим остатком.
+	// A dialog shorter than the depth is shown in full: the caveat here would
+	// send the agent after a remainder that does not exist.
 	brief := liveTools(&stubDialog{poll: func(int) []ChatMessage { return full[:3] }})
 	short, _, err := brief.read(ctx, nil, readArgs{Username: "ivan_petrov"})
-	if shown := toolText(t, short, err); strings.Contains(shown, "Показано не всё") {
-		t.Fatalf("полный диалог назван срезом:\n%s", shown)
+	if shown := toolText(t, short, err); strings.Contains(shown, "Not everything is shown") {
+		t.Fatalf("a full dialog is named a cut:\n%s", shown)
 	}
 }
 
-// Отказ рубежа доходит до агента человеческим текстом с названным следующим
-// шагом: доменная ошибка на английском не говорит вызывающему ничего.
+// A guard refusal reaches the agent as human text with the next step named: a
+// domain error in English says nothing to the caller.
 func TestBoundaryRefusalReadsAsText(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
 
 	if _, err := service.pool.Exec(ctx, `INSERT INTO stop_list (username) VALUES ('ivan_petrov')`); err != nil {
-		t.Fatalf("стоп-лист: %v", err)
+		t.Fatalf("stop list: %v", err)
 	}
 	handlers := &tools{service: service, chat: chatOn(service, &stubDialog{})}
 
 	_, _, err := handlers.send(ctx, nil, sendArgs{Username: "ivan_petrov", Text: "привет"})
 	if err == nil {
-		t.Fatal("сообщение человеку из стоп-листа принято")
+		t.Fatal("message to a person on the stop list accepted")
 	}
-	if !strings.Contains(err.Error(), "стоп-лист") {
-		t.Fatalf("отказ рубежа не переведён на человеческий: %v", err)
+	if !strings.Contains(err.Error(), "stop list") {
+		t.Fatalf("guard refusal is not translated into human language: %v", err)
 	}
 }
 
-// Неподнятая сессия - самый частый отказ живого контура: агент обязан
-// прочитать, что делать, а не «временную ошибку Telegram».
+// A session that is not up is the most common refusal of the live environment:
+// the agent must read what to do, not a "temporary Telegram error".
 func TestNotReadySessionExplainsItself(t *testing.T) {
 	handlers := &tools{
 		service: &Service{cfg: Config{AccountLabel: "test"}, Now: time.Now},
 		chat: offlineChat(&failDialog{err: &telegram.Failure{
-			Kind: telegram.KindNotReady, Message: "клиент не запущен",
+			Kind: telegram.KindNotReady, Message: "client not started",
 		}}),
 	}
 
 	_, _, err := handlers.read(context.Background(), nil, readArgs{Username: "ivan_petrov"})
 	if err == nil {
-		t.Fatal("чтение без сессии прошло")
+		t.Fatal("read without a session went through")
 	}
-	if !strings.Contains(err.Error(), "сессия") || !strings.Contains(err.Error(), "live-logs") {
-		t.Fatalf("отказ не называет неподнятую сессию: %v", err)
+	if !strings.Contains(err.Error(), "session") || !strings.Contains(err.Error(), "live-logs") {
+		t.Fatalf("refusal does not name the session that is not up: %v", err)
 	}
 }
 
-// tg_send отчитывается ценой, а не фактом отправки: после ручного касания
-// человек закрыт для всех кампаний, и вызывающий обязан это прочитать.
+// tg_send reports the price, not the fact of sending: after a manual touch the
+// person is closed to all campaigns, and the caller must read that.
 func TestDirectSendAnswerNamesThePrice(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service, chat: chatOn(service, &stubDialog{})}
@@ -436,16 +448,17 @@ func TestDirectSendAnswerNamesThePrice(t *testing.T) {
 	result, _, err := handlers.send(context.Background(), nil, sendArgs{Username: "@Ivan_Petrov", Text: "привет"})
 	text := toolText(t, result, err)
 
-	if !strings.Contains(text, "Касание записано: этот человек больше не попадёт ни в одну кампанию.") {
-		t.Fatalf("ответ tg_send не называет цену касания:\n%s", text)
+	if !strings.Contains(text, "Touch recorded: this person will not be included in any campaign from now on.") {
+		t.Fatalf("tg_send answer does not name the price of the touch:\n%s", text)
 	}
 	if !strings.Contains(text, "@ivan_petrov") {
-		t.Fatalf("ответ tg_send не называет нормализованный ник:\n%s", text)
+		t.Fatalf("tg_send answer does not name the normalized username:\n%s", text)
 	}
 }
 
-// liveTools - инструменты на живом контуре без базы: списки и чтение в неё не
-// ходят, а метка dry-run сбила бы проверку текста ответа.
+// liveTools are tools on the live environment without a database: lists and
+// reads do not go to it, and the dry-run mark would break the check of the
+// answer text.
 func liveTools(transport Dialog) *tools {
 	return &tools{
 		service: &Service{cfg: Config{AccountLabel: "test", Transport: "live"}, Now: time.Now},
@@ -453,8 +466,9 @@ func liveTools(transport Dialog) *tools {
 	}
 }
 
-// Человек без публичного ника: пустой @ агент принимает за ник и подставляет
-// его в tg_send. Ответ обязан назвать имя и сказать, что написать нельзя.
+// A person without a public username: the agent takes an empty @ for a username
+// and substitutes it into tg_send. The answer must name the person and say that
+// writing is not possible.
 func TestPeopleWithoutUsernameAreNamed(t *testing.T) {
 	ctx := context.Background()
 	handlers := liveTools(&stubDialog{
@@ -481,17 +495,17 @@ func TestPeopleWithoutUsernameAreNamed(t *testing.T) {
 			result, _, err := run.call()
 			text := toolText(t, result, err)
 			if strings.Contains(text, "@") {
-				t.Fatalf("человек без ника напечатан пустым @:\n%s", text)
+				t.Fatalf("a person without a username printed as an empty @:\n%s", text)
 			}
-			if !strings.Contains(text, "Дмитрий стоматолог") || !strings.Contains(text, "публичного ника нет") {
-				t.Fatalf("ответ не называет человека без ника:\n%s", text)
+			if !strings.Contains(text, "Дмитрий стоматолог") || !strings.Contains(text, "no public username") {
+				t.Fatalf("answer does not name the person without a username:\n%s", text)
 			}
 		})
 	}
 }
 
-// Список диалогов - обзор: длинная реплика схлопывается в одну строку и
-// режется по рунам, а чтение диалога отдаёт тот же текст целиком.
+// The dialog list is an overview: a long reply is collapsed into one line and
+// cut by runes, while a dialog read returns the same text in full.
 func TestDialogListShortensLastMessage(t *testing.T) {
 	ctx := context.Background()
 	long := strings.Repeat("я", 150) + "\nвторая строка"
@@ -507,22 +521,23 @@ func TestDialogListShortensLastMessage(t *testing.T) {
 	result, _, err := handlers.dialogs(ctx, nil, dialogsArgs{})
 	listed := toolText(t, result, err)
 	if !strings.Contains(listed, strings.Repeat("я", snippetLen)+"...") {
-		t.Fatalf("реплика в списке не обрезана по рунам:\n%s", listed)
+		t.Fatalf("reply in the list is not cut by runes:\n%s", listed)
 	}
 	if strings.Contains(listed, "вторая строка") {
-		t.Fatalf("реплика в списке заняла больше одной строки:\n%s", listed)
+		t.Fatalf("reply in the list took more than one line:\n%s", listed)
 	}
 
 	readResult, _, err := handlers.read(ctx, nil, readArgs{Username: "ivan_petrov"})
 	shown := toolText(t, readResult, err)
 	if !strings.Contains(shown, long) {
-		t.Fatalf("чтение диалога обрезало текст:\n%s", shown)
+		t.Fatalf("dialog read cut the text:\n%s", shown)
 	}
 }
 
-// Список смешан по видам: агент решает по слову в строке, куда можно писать, а
-// куда только читать. Безымянная сущность - группа или канал, откуда аккаунт
-// исключён; служебное верхнее сообщение приходит пустым и строки не печатает.
+// The list is mixed by kind: the agent decides by the word in the line where it
+// can write and where it can only read. A nameless entity is a group or channel
+// the account was removed from; a service top message arrives empty and prints
+// no line.
 func TestDialogListNamesEveryKind(t *testing.T) {
 	handlers := liveTools(&stubDialog{dialogs: []DialogInfo{
 		{Username: "ivan_petrov", Name: "Иван", Ref: telegram.NewRef(telegram.KindUser, 10), Unread: 2,
@@ -538,70 +553,72 @@ func TestDialogListNamesEveryKind(t *testing.T) {
 	result, _, err := handlers.dialogs(context.Background(), nil, dialogsArgs{})
 	listed := toolText(t, result, err)
 	for _, line := range []string{
-		"человек: @ivan_petrov Иван, непрочитанных 2",
-		"человек: Дмитрий стоматолог; публичного ника нет",
-		"группа: Чат клуба, непрочитанных 7",
-		"группа: @club_core Ядро",
-		"канал: @club_news Анонсы, непрочитанных 3",
-		"группа: название неизвестно",
+		"person: @ivan_petrov Иван, 2 unread",
+		"person: Дмитрий стоматолог; no public username",
+		"group: Чат клуба, 7 unread",
+		"group: @club_core Ядро",
+		"channel: @club_news Анонсы, 3 unread",
+		"group: title unknown",
 	} {
 		if !strings.Contains(listed, line) {
-			t.Fatalf("в списке нет строки %q:\n%s", line, listed)
+			t.Fatalf("the list has no line %q:\n%s", line, listed)
 		}
 	}
 	if strings.Count(listed, noUsernameNote) != 1 {
-		t.Fatalf("совет про tg_send стоит не только у человека:\n%s", listed)
+		t.Fatalf("the advice about tg_send stands not only at the person:\n%s", listed)
 	}
-	if strings.Contains(listed, "[без текста]") {
-		t.Fatalf("диалог без последнего сообщения напечатан пустой репликой:\n%s", listed)
+	if strings.Contains(listed, "[no text]") {
+		t.Fatalf("a dialog with no last message printed as an empty reply:\n%s", listed)
 	}
 }
 
-// Точное совпадение ника - тот, кого искали: в префиксной выдаче он стоит
-// вперемешку с чужими похожими никами и теряется, поэтому идёт первым и с
-// пометкой.
+// An exact username match is the one being looked for: in a prefix result it
+// stands among other people's similar usernames and gets lost, so it goes first
+// and with a mark.
 func TestExactUsernameGoesFirst(t *testing.T) {
 	handlers := liveTools(&stubDialog{found: []Contact{
 		{Username: "smirnovenko", Name: "Пётр"},
-		{Username: "smirnov", Name: "Даниил", IsContact: true, Exact: true},
+		{Username: "smirnov", Name: "Алексей", IsContact: true, Exact: true},
 	}})
 
 	result, _, err := handlers.find(context.Background(), nil, findArgs{Query: "smirnov"})
 	text := toolText(t, result, err)
-	if !strings.Contains(text, "@smirnov Даниил - точный ник - в контактах") {
-		t.Fatalf("точный ник напечатан без пометки:\n%s", text)
+	if !strings.Contains(text, "@smirnov Алексей - exact username - in contacts") {
+		t.Fatalf("exact username printed without a mark:\n%s", text)
 	}
 	if strings.Index(text, "@smirnov ") > strings.Index(text, "@smirnovenko") {
-		t.Fatalf("точный ник не первый в списке:\n%s", text)
+		t.Fatalf("exact username is not first in the list:\n%s", text)
 	}
 }
 
-// Похожие ники - другие люди: без предупреждения агент пишет первому в списке.
-// Запрос нормализуется как в поиске, иначе «@SmirnovE» не признаётся ником и
-// печатается с двойной собакой. По имени предупреждения нет: точного совпадения
-// там не ждут.
+// Similar usernames are other people: without a warning the agent writes to the
+// first one in the list. The query is normalized as in the search, otherwise
+// "@SmirnovE" is not recognized as a username and prints with a double at-sign.
+// There is no warning for a name: an exact match is not expected there.
 func TestSimilarUsernamesAreWarnedAbout(t *testing.T) {
 	ctx := context.Background()
 	handlers := liveTools(&stubDialog{found: []Contact{{Username: "smirnovenko", Name: "Пётр"}}})
 
-	// «@ SmirnovE» - тот же ник: пробел после собаки не делает запрос именем.
+	// "@ SmirnovE" is the same username: a space after the at-sign does not make
+	// the query a name.
 	for _, query := range []string{"@SmirnovE", "@ SmirnovE"} {
 		result, _, err := handlers.find(ctx, nil, findArgs{Query: query})
 		text := toolText(t, result, err)
-		if !strings.Contains(text, "Среди найденных точного ника @smirnove нет") {
-			t.Fatalf("похожие ники по запросу %q выданы без предупреждения:\n%s", query, text)
+		if !strings.Contains(text, "None of the results is the exact username @smirnove") {
+			t.Fatalf("similar usernames for the query %q returned without a warning:\n%s", query, text)
 		}
 	}
 
 	byName, _, err := handlers.find(ctx, nil, findArgs{Query: "Пётр"})
-	if shown := toolText(t, byName, err); strings.Contains(shown, "точного ника") {
-		t.Fatalf("поиск по имени предупреждает о точном нике:\n%s", shown)
+	if shown := toolText(t, byName, err); strings.Contains(shown, "None of the results") {
+		t.Fatalf("a search by name warns about an exact username:\n%s", shown)
 	}
 }
 
-// status по id отвечает про названную кампанию: итог прогона иначе недоступен -
-// его перекрывает следующая кампания. Чужой id - отказ, а не отчёт без кампании:
-// аккаунты вместо итога читаются как «кампания пуста».
+// status by id answers about the named campaign: otherwise the result of a run
+// is unavailable - the next campaign covers it. A foreign id is a refusal, not
+// a report without a campaign: accounts in place of the totals read as "the
+// campaign is empty".
 func TestStatusAnswersByCampaignID(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service}
@@ -609,46 +626,46 @@ func TestStatusAnswersByCampaignID(t *testing.T) {
 
 	closed := startWith(t, service, person(1, "ivan_petrov"))
 	if _, err := service.StopCampaign(ctx, true); err != nil {
-		t.Fatalf("отменить кампанию: %v", err)
+		t.Fatalf("cancel the campaign: %v", err)
 	}
 	live, err := service.LoadCampaign(ctx, "Привет, {имя}!", "вторая")
 	if err != nil {
-		t.Fatalf("создать вторую кампанию: %v", err)
+		t.Fatalf("create the second campaign: %v", err)
 	}
 	if _, err := service.AddRecipients(ctx, live, []Person{person(2, "petr_ivanov")}); err != nil {
-		t.Fatalf("добавить получателей: %v", err)
+		t.Fatalf("add recipients: %v", err)
 	}
 	if _, err := service.StartCampaign(ctx); err != nil {
-		t.Fatalf("запустить вторую кампанию: %v", err)
+		t.Fatalf("start the second campaign: %v", err)
 	}
 
 	current, _, err := handlers.status(ctx, nil, statusArgs{})
 	if text := toolText(t, current, err); !strings.Contains(text, fmt.Sprintf("id %d", live)) {
-		t.Fatalf("status без параметра показал не текущую кампанию:\n%s", text)
+		t.Fatalf("status without a parameter showed not the current campaign:\n%s", text)
 	}
 
 	named, _, err := handlers.status(ctx, nil, statusArgs{CampaignID: closed})
 	text := toolText(t, named, err)
 	if !strings.Contains(text, fmt.Sprintf("id %d", closed)) || !strings.Contains(text, "cancelled") {
-		t.Fatalf("status по id показал не названную кампанию:\n%s", text)
+		t.Fatalf("status by id showed not the named campaign:\n%s", text)
 	}
 
-	// Отрицательный id - та же опечатка, что и чужой: отчёт о текущей кампании в
-	// ответ на него читается как отчёт о запрошенной.
+	// A negative id is the same typo as a foreign one: a report on the current
+	// campaign in answer to it reads as a report on the requested one.
 	for _, id := range []int64{9999, -1} {
 		_, _, err := handlers.status(ctx, nil, statusArgs{CampaignID: id})
 		if err == nil {
-			t.Fatalf("id %d принят как кампания", id)
+			t.Fatalf("id %d accepted as a campaign", id)
 		}
 		if !strings.Contains(err.Error(), fmt.Sprintf("%d", id)) {
-			t.Fatalf("отказ не называет запрошенный id %d: %v", id, err)
+			t.Fatalf("refusal does not name the requested id %d: %v", id, err)
 		}
 	}
 }
 
-// Аннотация ReadOnlyHint - обещание клиенту, что вызов ничего не меняет: с ней
-// инструмент проходит без подтверждения. Обещать её у tg_send или start - значит
-// пустить отправку наружу молча.
+// The ReadOnlyHint annotation is a promise to the client that the call changes
+// nothing: with it the tool passes without confirmation. Promising it for
+// tg_send or start would let sending out go silently.
 func TestReadToolsAreReadOnly(t *testing.T) {
 	ctx := context.Background()
 	serverSide, clientSide := mcp.NewInMemoryTransports()
@@ -656,19 +673,19 @@ func TestReadToolsAreReadOnly(t *testing.T) {
 	server := NewMCPServer(&Service{cfg: Config{AccountLabel: "test"}, Now: time.Now}, nil)
 	serverSession, err := server.Connect(ctx, serverSide, nil)
 	if err != nil {
-		t.Fatalf("поднять сервер: %v", err)
+		t.Fatalf("start the server: %v", err)
 	}
 	defer func() { _ = serverSession.Close() }()
 
 	session, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1.0.0"}, nil).Connect(ctx, clientSide, nil)
 	if err != nil {
-		t.Fatalf("подключиться: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
 	defer func() { _ = session.Close() }()
 
 	list, err := session.ListTools(ctx, nil)
 	if err != nil {
-		t.Fatalf("список инструментов: %v", err)
+		t.Fatalf("list tools: %v", err)
 	}
 	readOnly := map[string]bool{}
 	for _, tool := range list.Tools {
@@ -676,19 +693,19 @@ func TestReadToolsAreReadOnly(t *testing.T) {
 	}
 	for _, name := range []string{"tg_find", "tg_read", "tg_dialogs", "status"} {
 		if !readOnly[name] {
-			t.Fatalf("%s не помечен как читающий инструмент", name)
+			t.Fatalf("%s is not marked as a reading tool", name)
 		}
 	}
 	for _, name := range []string{"tg_send", "start"} {
 		if readOnly[name] {
-			t.Fatalf("%s помечен как читающий, а он пишет наружу", name)
+			t.Fatalf("%s is marked as reading, but it writes outward", name)
 		}
 	}
 }
 
-// start вне окна обязан назвать, когда отправка пойдёт: правило «окно 10:00-19:00»
-// не отвечает на вопрос «а сейчас-то что», и запуск вечером пятницы выглядит как
-// пошедшая отправка.
+// start outside the window must name when sending will begin: the rule "window
+// 10:00-19:00" does not answer "and what about now", and a start on Friday
+// evening looks like sending in progress.
 func TestStartOutsideWindowNamesOpening(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service}
@@ -696,23 +713,24 @@ func TestStartOutsideWindowNamesOpening(t *testing.T) {
 
 	id, err := service.LoadCampaign(ctx, "Привет, {имя}!", "тест")
 	if err != nil {
-		t.Fatalf("создать черновик: %v", err)
+		t.Fatalf("create draft: %v", err)
 	}
 	if _, err := service.AddRecipients(ctx, id, []Person{person(1, "ivan_petrov")}); err != nil {
-		t.Fatalf("добавить получателей: %v", err)
+		t.Fatalf("add recipients: %v", err)
 	}
-	// Суббота той же недели: окно закрыто до утра понедельника.
+	// Saturday of the same week: the window is closed until Monday morning.
 	service.Now = func() time.Time { return testNow.AddDate(0, 0, 3) }
 
 	result, _, err := handlers.start(ctx, nil, struct{}{})
 	text := toolText(t, result, err)
-	if !strings.Contains(text, "окно отправки закрыто, ближайшее открытие 07.09 10:00 МСК") {
-		t.Fatalf("start вне окна не назвал открытие:\n%s", text)
+	if !strings.Contains(text, "the send window is closed, next opening 07.09 10:00 MSK") {
+		t.Fatalf("start outside the window did not name the opening:\n%s", text)
 	}
 }
 
-// Совет в простое идёт по обстановке: черновик запускает start, а закрытая
-// кампания заново не идёт - там start откажет, и создавать надо новую.
+// The advice during an idle follows the situation: start launches a draft, while
+// a closed campaign does not run again - start refuses there, and a new one has
+// to be created.
 func TestIdleAdviceFollowsWhatCanStart(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service}
@@ -720,32 +738,32 @@ func TestIdleAdviceFollowsWhatCanStart(t *testing.T) {
 
 	id, err := service.LoadCampaign(ctx, "Привет, {имя}!", "тест")
 	if err != nil {
-		t.Fatalf("создать черновик: %v", err)
+		t.Fatalf("create draft: %v", err)
 	}
 	if _, err := service.AddRecipients(ctx, id, []Person{person(1, "ivan_petrov")}); err != nil {
-		t.Fatalf("добавить получателей: %v", err)
+		t.Fatalf("add recipients: %v", err)
 	}
 
 	draft, _, err := handlers.status(ctx, nil, statusArgs{})
-	if text := toolText(t, draft, err); !strings.Contains(text, "запустите её через start") {
-		t.Fatalf("единственный черновик остался без совета start:\n%s", text)
+	if text := toolText(t, draft, err); !strings.Contains(text, "launch one with start") {
+		t.Fatalf("the lone draft is left without the start advice:\n%s", text)
 	}
 
 	if _, err := service.StopCampaign(ctx, true); err != nil {
-		t.Fatalf("отменить черновик: %v", err)
+		t.Fatalf("cancel the draft: %v", err)
 	}
 	closed, _, err := handlers.status(ctx, nil, statusArgs{})
 	text := toolText(t, closed, err)
 	if strings.Contains(text, "start") {
-		t.Fatalf("по закрытой кампании советуется start:\n%s", text)
+		t.Fatalf("start is advised for a closed campaign:\n%s", text)
 	}
 	if !strings.Contains(text, "load_campaign") {
-		t.Fatalf("по закрытой кампании не названо, чем создать новую:\n%s", text)
+		t.Fatalf("a closed campaign does not name what creates a new one:\n%s", text)
 	}
 }
 
-// Сломанный шаблон называется у любой кампании, а снять её через stop
-// советуется только живой: по закрытой stop откажет - снимать нечего.
+// A broken template is named on any campaign, but removing it through stop is
+// advised only for a live one: on a closed one stop refuses - nothing to remove.
 func TestBrokenTemplateAdviceFitsTheCampaign(t *testing.T) {
 	service := newService(t)
 	handlers := &tools{service: service}
@@ -755,25 +773,25 @@ func TestBrokenTemplateAdviceFitsTheCampaign(t *testing.T) {
 	runSQL(t, service, `UPDATE campaigns SET template_text = 'Привет, {{имя}}!' WHERE id = $1`, id)
 
 	live, _, err := handlers.status(ctx, nil, statusArgs{})
-	if text := toolText(t, live, err); !strings.Contains(text, "негодную снимите через stop с cancel") {
-		t.Fatalf("по идущей кампании нет совета снять её:\n%s", text)
+	if text := toolText(t, live, err); !strings.Contains(text, "remove the broken one with stop and cancel") {
+		t.Fatalf("a running campaign has no advice to remove it:\n%s", text)
 	}
 
 	if _, err := service.StopCampaign(ctx, true); err != nil {
-		t.Fatalf("отменить кампанию: %v", err)
+		t.Fatalf("cancel the campaign: %v", err)
 	}
 	closed, _, err := handlers.status(ctx, nil, statusArgs{CampaignID: id})
 	text := toolText(t, closed, err)
-	if !strings.Contains(text, "Шаблон этой кампании не разобран") {
-		t.Fatalf("по закрытой кампании не назван сломанный шаблон:\n%s", text)
+	if !strings.Contains(text, "This campaign's template could not be parsed") {
+		t.Fatalf("the broken template is not named on a closed campaign:\n%s", text)
 	}
-	if strings.Contains(text, "stop с cancel") {
-		t.Fatalf("по закрытой кампании советуется stop:\n%s", text)
+	if strings.Contains(text, "stop and cancel") {
+		t.Fatalf("stop is advised for a closed campaign:\n%s", text)
 	}
 }
 
-// Сообщение без текста и вложения: пустая строка «он: » не сообщает читателю
-// ничего. Нулевое время у такой строки тоже не должно её ломать.
+// A message with no text and no attachment: an empty line "them: " tells the
+// reader nothing. A zero time on such a row must not break it either.
 func TestEmptyMessageIsNamed(t *testing.T) {
 	handlers := liveTools(&stubDialog{
 		poll: func(int) []ChatMessage { return []ChatMessage{{ID: 1}} },
@@ -781,12 +799,12 @@ func TestEmptyMessageIsNamed(t *testing.T) {
 
 	result, _, err := handlers.read(context.Background(), nil, readArgs{Username: "ivan_petrov"})
 	text := toolText(t, result, err)
-	if !strings.Contains(text, "  он: [без текста]\n") {
-		t.Fatalf("сообщение без текста напечатано пустым:\n%s", text)
+	if !strings.Contains(text, "  them: [no text]\n") {
+		t.Fatalf("a message with no text printed empty:\n%s", text)
 	}
 }
 
-// agentService - сервис с обоими токенами и списком агента; базы не нужно.
+// agentService is a service with both tokens and the agent's list; no database needed.
 func agentService() *Service {
 	return &Service{cfg: Config{
 		AccountLabel:   "test",
@@ -796,7 +814,7 @@ func agentService() *Service {
 	}, Now: time.Now}
 }
 
-// bearer подставляет токен в каждый запрос клиента MCP.
+// bearer puts the token into every request of the MCP client.
 type bearer struct{ token string }
 
 func (b bearer) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -805,7 +823,7 @@ func (b bearer) RoundTrip(req *http.Request) (*http.Response, error) {
 	return http.DefaultTransport.RoundTrip(req)
 }
 
-// toolsBehind подключается к эндпоинту с токеном и отдаёт имена инструментов.
+// toolsBehind connects to the endpoint with a token and returns the tool names.
 func toolsBehind(t *testing.T, endpoint, token string) (map[string]bool, error) {
 	t.Helper()
 	ctx := context.Background()
@@ -831,9 +849,10 @@ func toolsBehind(t *testing.T, endpoint, token string) (map[string]bool, error) 
 	return names, nil
 }
 
-// Токен определяет набор инструментов: агенту видны только два диалоговых, и
-// кампании, стоп аккаунта и чужая переписка ему недоступны вовсе. Точный набор,
-// а не отсутствие одного start: утёкший tg_dialogs иначе прошёл бы тест.
+// The token determines the set of tools: the agent sees only the two dialog
+// tools, and campaigns, the account stop and other people's conversations are
+// not available to it at all. The exact set, not the absence of a single start:
+// a leaked tg_dialogs would otherwise pass the test.
 func TestTokenPicksTools(t *testing.T) {
 	service := agentService()
 	server := httptest.NewServer(MCPHandler(service, offlineChat(&stubDialog{})))
@@ -841,28 +860,28 @@ func TestTokenPicksTools(t *testing.T) {
 
 	owner, err := toolsBehind(t, server.URL, "owner-token")
 	if err != nil {
-		t.Fatalf("владелец не подключился: %v", err)
+		t.Fatalf("owner did not connect: %v", err)
 	}
 	if len(owner) != 10 {
-		t.Fatalf("владельцу видно %d инструментов, ждали 10: %v", len(owner), owner)
+		t.Fatalf("owner sees %d tools, expected 10: %v", len(owner), owner)
 	}
 
 	agent, err := toolsBehind(t, server.URL, "agent-token")
 	if err != nil {
-		t.Fatalf("агент не подключился: %v", err)
+		t.Fatalf("agent did not connect: %v", err)
 	}
 	if len(agent) != 2 || !agent["tg_send"] || !agent["tg_read"] {
-		t.Fatalf("агенту видно %v, ждали ровно tg_send и tg_read", agent)
+		t.Fatalf("agent sees %v, expected exactly tg_send and tg_read", agent)
 	}
 
 	if _, err := toolsBehind(t, server.URL, "wrong-token"); err == nil {
-		t.Fatal("чужой токен пущен")
+		t.Fatal("a foreign token was let in")
 	}
 }
 
-// Сессия принадлежит токену, который её открыл: агентский токен не
-// продолжает сессию владельца, и наоборот. Иначе агент получил бы кампании,
-// узнав номер сессии.
+// A session belongs to the token that opened it: the agent token does not
+// continue the owner's session, and vice versa. Otherwise the agent would get
+// the campaigns by learning a session id.
 func TestSessionBelongsToItsToken(t *testing.T) {
 	server := httptest.NewServer(MCPHandler(agentService(), offlineChat(&stubDialog{})))
 	t.Cleanup(server.Close)
@@ -893,22 +912,23 @@ func TestSessionBelongsToItsToken(t *testing.T) {
 		opened := post(pair[0], "", initialize)
 		session := opened.Header.Get("Mcp-Session-Id")
 		if session == "" {
-			t.Fatalf("%s: сессия не открылась, код %d", pair[0], opened.StatusCode)
+			t.Fatalf("%s: session did not open, code %d", pair[0], opened.StatusCode)
 		}
 		if resp := post(pair[1], session, list); resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("сессия %s продолжена токеном %s: код %d", pair[0], pair[1], resp.StatusCode)
+			t.Fatalf("session of %s continued with token %s: code %d", pair[0], pair[1], resp.StatusCode)
 		}
 	}
 }
 
-// Агент пишет и читает только тестовые аккаунты, и отказывает сам сервис до
-// похода в Telegram. Вызовы идут через собранный NewAgentServer: подмена
-// обработчика или списка в сборке роняет тест. Ник приводится той же
-// нормализацией, что в Chat: запись с @, в другом регистре или ссылкой не
-// обходит список и не ломает законный ник.
+// The agent writes to and reads from test accounts only, and the service itself
+// refuses before going to Telegram. The calls go through the assembled
+// NewAgentServer: swapping the handler or the list in the assembly breaks the
+// test. The username is normalized the same way as in Chat: a form with @, in
+// another case or as a link neither bypasses the list nor breaks a legitimate
+// username.
 func TestAgentReachesOnlyTestAccounts(t *testing.T) {
 	ctx := context.Background()
-	notReady := &telegram.Failure{Kind: telegram.KindNotReady, Message: "клиент не запущен"}
+	notReady := &telegram.Failure{Kind: telegram.KindNotReady, Message: "client not started"}
 	service := agentService()
 	service.cfg.OwnerAccounts = []string{"smirnov"}
 	server := NewAgentServer(service, offlineChat(&failDialog{err: notReady}))
@@ -916,12 +936,12 @@ func TestAgentReachesOnlyTestAccounts(t *testing.T) {
 	serverSide, clientSide := mcp.NewInMemoryTransports()
 	serverSession, err := server.Connect(ctx, serverSide, nil)
 	if err != nil {
-		t.Fatalf("поднять сервер: %v", err)
+		t.Fatalf("start the server: %v", err)
 	}
 	t.Cleanup(func() { _ = serverSession.Close() })
 	session, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1.0.0"}, nil).Connect(ctx, clientSide, nil)
 	if err != nil {
-		t.Fatalf("подключиться: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() { _ = session.Close() })
 
@@ -937,8 +957,8 @@ func TestAgentReachesOnlyTestAccounts(t *testing.T) {
 		{"dev_account/x", false},
 	}
 	for _, tc := range cases {
-		// Пустой текст отбивает Chat.Send до базы и Telegram: отказ про текст
-		// и значит, что вызов прошёл список агента.
+		// An empty text is rejected by Chat.Send before the database and Telegram:
+		// a refusal about the text means the call passed the agent's list.
 		calls := map[string]map[string]any{
 			"tg_send": {"username": tc.username, "text": ""},
 			"tg_read": {"username": tc.username},
@@ -946,7 +966,7 @@ func TestAgentReachesOnlyTestAccounts(t *testing.T) {
 		for tool, arguments := range calls {
 			result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: arguments})
 			if err != nil {
-				t.Fatalf("%s %q: вызов: %v", tool, tc.username, err)
+				t.Fatalf("%s %q: call: %v", tool, tc.username, err)
 			}
 			var text strings.Builder
 			for _, content := range result.Content {
@@ -956,7 +976,7 @@ func TestAgentReachesOnlyTestAccounts(t *testing.T) {
 			}
 			refused := strings.Contains(text.String(), "AGENT_ALLOW_LIST")
 			if refused == tc.allowed {
-				t.Fatalf("%s %q: ждали пропуск %v, ответ %q", tool, tc.username, tc.allowed, text.String())
+				t.Fatalf("%s %q: expected pass %v, answer %q", tool, tc.username, tc.allowed, text.String())
 			}
 		}
 	}

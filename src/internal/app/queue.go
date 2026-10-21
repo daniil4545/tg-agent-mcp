@@ -12,13 +12,13 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/db"
 )
 
-// moscowZone - МСК фиксированным смещением, а не Europe/Moscow: перевода часов
-// в Москве нет с 2014 года, а tzdata в контейнере может не оказаться, и тогда
-// окно отправки молча уехало бы в UTC.
+// moscowZone is MSK as a fixed offset rather than Europe/Moscow: Moscow has had
+// no clock changes since 2014, and the container may lack tzdata, in which case
+// the send window would silently shift to UTC.
 var moscowZone = time.FixedZone("MSK", 3*60*60)
 
-// Recipient - строка очереди, взятая отправщиком. Текст уже собран: за
-// шаблоном в базу отправщик не возвращается.
+// Recipient is a queue row taken by the sender. The text is already rendered:
+// the sender does not go back to the database for the template.
 type Recipient struct {
 	ID         int64
 	CampaignID int64
@@ -29,46 +29,47 @@ type Recipient struct {
 	RandomID   int64
 	Text       string
 
-	// UserID - id человека в Telegram, известный после резолва. Заполняет
-	// отправщик перед финализацией: по нему находится ответ человека, чей
-	// апдейт пришёл без ника.
+	// UserID is the person's Telegram id, known after the resolve. The sender
+	// fills it in before finalizing: it is how a reply is matched to a person
+	// whose update arrived without a username.
 	UserID int64
 }
 
-// SendResult - исход доставки взятой строки.
+// SendResult is the delivery outcome of a claimed row.
 type SendResult string
 
 const (
-	ResultSent         SendResult = "sent"          // доставлено, человек израсходован
-	ResultUndelivered  SendResult = "undelivered"   // отказ по человеку, повтор не поможет
-	ResultRetry        SendResult = "retry"         // временный отказ: строка возвращается в очередь
-	ResultRetryCounted SendResult = "retry_counted" // временный отказ с расходом попытки
+	ResultSent         SendResult = "sent"          // delivered, the person is used up
+	ResultUndelivered  SendResult = "undelivered"   // refused for this person, a retry will not help
+	ResultRetry        SendResult = "retry"         // temporary failure: the row goes back to the queue
+	ResultRetryCounted SendResult = "retry_counted" // temporary failure that spends an attempt
 )
 
-// ReasonRetryExhausted - причина ухода строки из очереди по исчерпанию бюджета
-// попыток. Живёт здесь, а не среди причин отсева импорта: её ставит только
-// финализация.
+// ReasonRetryExhausted is the reason a row leaves the queue after its attempt
+// budget runs out. It lives here, not among the import screening reasons: only
+// finalization sets it.
 const ReasonRetryExhausted = "retry_exhausted"
 
-// maxAttempts - бюджет расходуемых попыток на строку. Выборка берёт первую
-// строку по id, поэтому строка со стабильной неопознанной ошибкой без бюджета
-// держала бы голову очереди вечно и кампания не двигалась бы.
+// maxAttempts is the budget of spendable attempts per row. The selection takes
+// the first row by id, so a row with a stable unrecognized error and no budget
+// would hold the head of the queue forever and the campaign would not move.
 const maxAttempts = 5
 
-// maxSkips - сколько негодных строк снимает один виток выборки, прежде чем
-// вернуть очередь следующему. Потолок нужен ровно затем, чтобы транзакция не
-// росла: она держит блокировку строки аккаунта, а её ждёт и ручная отправка.
+// maxSkips is how many unfit rows one selection pass removes before handing the
+// queue back. The cap exists so the transaction stays short: it holds the
+// account row lock, which manual sending also waits on.
 const maxSkips = 50
 
-// EnsureAccount заводит строку аккаунта под метку процесса при первом старте и
-// отдаёт действующий потолок. daily_limit существующей строки не
-// переписывается: потолок живёт в БД, и перезапуск с другой переменной
-// окружения не должен его тихо поднять - расхождение называет старт процесса.
+// EnsureAccount creates the account row for the process label on first start
+// and returns the effective cap. The daily_limit of an existing row is not
+// overwritten: the cap lives in the database, and a restart with a different
+// environment variable must not quietly raise it - process startup reports the
+// mismatch.
 func (s *Service) EnsureAccount(ctx context.Context) (int64, int, error) {
 	var id int64
 	var limit int
-	// DO UPDATE вместо DO NOTHING только ради RETURNING: DO NOTHING на
-	// конфликте не возвращает строку вовсе.
+	// DO UPDATE instead of DO NOTHING only for RETURNING: DO NOTHING returns
+	// no row at all on a conflict.
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO accounts (label, daily_limit) VALUES ($1, $2)
 		 ON CONFLICT (label) DO UPDATE SET label = EXCLUDED.label
@@ -80,17 +81,19 @@ func (s *Service) EnsureAccount(ctx context.Context) (int64, int, error) {
 	return id, limit, nil
 }
 
-// ClaimNext берёт одну строку очереди под аккаунт. Транзакция короткая и без
-// единого сетевого вызова: под блокировкой строки аккаунта проверяются рубежи
-// (окно, стоп аккаунта, дневной потолок, активная кампания, стоп-лист,
-// «получал в любой кампании»), затем строка помечается claimed_at.
+// ClaimNext takes one queue row for the account. The transaction is short and
+// makes no network call: under the account row lock it checks the gates (send
+// window, account stop, daily cap, active campaign, stop list, "received in any
+// campaign"), then marks the row with claimed_at.
 //
-// nil без ошибки - очередь пуста или рубеж не пускает; это штатный ответ.
+// nil without an error means the queue is empty or a gate blocks sending; this
+// is a normal answer.
 func (s *Service) ClaimNext(ctx context.Context, accountLabel string) (*Recipient, error) {
 	now := s.Now()
-	// Ранний выход по закрытому окну остаётся, пока список служебных адресатов
-	// пуст: ночью и в выходные к базе не ходим вовсе. Непустой список даёт
-	// строкам владельца путь и вне окна, поэтому там транзакция всё же нужна.
+	// The early exit on a closed window stays while the list of service
+	// recipients is empty: at night and on weekends we do not touch the
+	// database at all. A non-empty list gives owner rows a path outside the
+	// window too, so the transaction is still needed then.
 	ownerOnly := !s.inSendWindow(now)
 	if ownerOnly && len(s.owners) == 0 {
 		return nil, nil
@@ -99,8 +102,8 @@ func (s *Service) ClaimNext(ctx context.Context, accountLabel string) (*Recipien
 
 	var claimed *Recipient
 	err := db.InTx(ctx, s.pool, func(tx pgx.Tx) error {
-		// Блокировка строки аккаунта сериализует отправщиков одного аккаунта:
-		// иначе два процесса пройдут проверку потолка одновременно.
+		// The account row lock serializes senders of one account: otherwise two
+		// processes would pass the cap check at the same time.
 		var accountID int64
 		var dailyLimit int
 		var stopped bool
@@ -117,8 +120,8 @@ func (s *Service) ClaimNext(ctx context.Context, accountLabel string) (*Recipien
 			return nil
 		}
 
-		// Живой claim считается наравне с отправленным: строка, взятая другим
-		// процессом, уже почти сообщение.
+		// A live claim counts the same as a sent message: a row taken by another
+		// process is almost a message already.
 		var used int
 		if err := tx.QueryRow(ctx, s.accountUsedSQL,
 			startOfDay(now), stale, accountID).Scan(&used); err != nil {
@@ -142,13 +145,14 @@ func (s *Service) ClaimNext(ctx context.Context, accountLabel string) (*Recipien
 			return fmt.Errorf("load active campaign: %w", err)
 		}
 
-		// Шаблон с неразобранной скобкой отправляться не имеет права: кампания,
-		// собранная прошлой версией, где «{{имя}}» проходил вход, дала бы живому
-		// человеку «Привет, {Пётр}!». Рубеж стоит здесь, а не только в
-		// StartCampaign, потому что кампания, ставшая active до обновления, через
-		// start больше не проходит, а сюда приходит каждое сообщение. Состояние
-		// кампании при этом не меняется: его ведёт человек, а сломанный шаблон -
-		// причина простоя очереди, и называет её IdleReason.
+		// A template with an unresolved brace must not be sent: a campaign built
+		// by an earlier version, where "{{имя}}" passed validation, would give a
+		// real person "Привет, {Пётр}!". The gate sits here, not only in
+		// StartCampaign, because a campaign that became active before the
+		// upgrade no longer goes through start, while every message comes
+		// through here. The campaign state does not change: a human drives it,
+		// and a broken template is a reason for the queue to idle, which
+		// IdleReason reports.
 		if _, total := badBraces(template); total > 0 {
 			return nil
 		}
@@ -157,11 +161,12 @@ func (s *Service) ClaimNext(ctx context.Context, accountLabel string) (*Recipien
 			return fmt.Errorf("skip disqualified: %w", err)
 		}
 
-		// Строки с негодным именем снимаются здесь же, а не только на импорте:
-		// загруженные до появления этого рубежа иначе ушли бы живым людям письмом,
-		// начинающимся с запятой или с чужой скобкой. Порядок после общего отсева
-		// не случаен: человеку и в стоп-листе, и без имени причиной называется
-		// стоп-лист - рубеж, который его остановил бы в любом случае.
+		// Rows with an unfit name are removed here too, not only on import: rows
+		// loaded before this gate existed would otherwise reach real people in a
+		// message starting with a comma or a stray brace. The order after the
+		// general screening is deliberate: for a person who is both on the stop
+		// list and nameless, the reason is the stop list - the gate that would
+		// have stopped them anyway.
 		needName := hasName(template)
 		if needName {
 			if _, err := tx.Exec(ctx, skipBadNamesSQL, campaignID, stale); err != nil {
@@ -169,13 +174,14 @@ func (s *Service) ClaimNext(ctx context.Context, accountLabel string) (*Recipien
 			}
 		}
 
-		// Последняя проверка имени - на взятой строке и тем же ответом, что на
-		// импорте: длина письма зависит от шаблона и меряется в единицах UTF-16, и
-		// в SQL-условии выборки её точно не выразить. Негодные строки снимаются
-		// подряд, а не по одной за виток: снятая выходит из planned, и тот же
-		// запрос её уже не видит, - иначе сорок таких строк разбираются часами и
-		// всё это время кампания выглядит идущей. Потолок витка держит транзакцию
-		// короткой: она блокирует строку аккаунта, которую ждёт и ручная отправка.
+		// The last name check runs on the claimed row and gives the same answer as
+		// on import: the message length depends on the template and is measured in
+		// UTF-16 units, which the selection's SQL condition cannot express
+		// exactly. Unfit rows are removed one after another, not one per pass: a
+		// removed row leaves planned and the same query no longer sees it -
+		// otherwise forty such rows take hours to clear while the campaign looks
+		// like it is running. The pass cap keeps the transaction short: it locks
+		// the account row, which manual sending also waits on.
 		var picked *Recipient
 		for range maxSkips {
 			var item Recipient
@@ -222,44 +228,46 @@ func (s *Service) ClaimNext(ctx context.Context, accountLabel string) (*Recipien
 	return claimed, nil
 }
 
-// Причины простоя очереди: почему отправщик сейчас молчит. Отвечают на вопрос
-// «почему письмо не ушло вовремя», ради которого сервис и наблюдают.
+// Queue idle reasons: why the sender is silent right now. They answer the
+// question "why did the message not go out on time", which is what the service
+// is watched for.
 const (
-	IdleWindowClosed   = "send_window_closed"  // не будни или вне окна отправки
-	IdleAccountStop    = "account_stopped"     // ограничение аккаунта, снимается человеком
-	IdleDailyLimit     = "daily_limit_reached" // дневной потолок аккаунта израсходован
-	IdleNoCampaign     = "no_active_campaign"  // работать не над чем
-	IdleBrokenTemplate = "broken_template"     // в шаблоне кампании неразобранные скобки
-	IdleQueueEmpty     = "queue_empty"         // в кампании не осталось строк в очереди
-	IdleQueueBlocked   = "queue_blocked"       // строки есть, но закреплены за другим аккаунтом или взяты
-	// строки есть, но все до одной снимаются рубежом: отправок по ним не будет
+	IdleWindowClosed   = "send_window_closed"  // not a weekday or outside the send window
+	IdleAccountStop    = "account_stopped"     // account restriction, lifted by a human
+	IdleDailyLimit     = "daily_limit_reached" // the account daily cap is used up
+	IdleNoCampaign     = "no_active_campaign"  // nothing to work on
+	IdleBrokenTemplate = "broken_template"     // the campaign template has unresolved braces
+	IdleQueueEmpty     = "queue_empty"         // the campaign has no rows left in the queue
+	IdleQueueBlocked   = "queue_blocked"       // rows exist but are pinned to another account or claimed
+	// rows exist but a gate removes every one of them: nothing will be sent
 	IdleQueueDisqualified = "queue_disqualified"
-	IdleClaimRaceLost     = "claim_race_lost" // строка доступна, но её забрал сосед между витками
+	IdleClaimRaceLost     = "claim_race_lost" // a row is available but a neighbor took it between passes
 )
 
-// Idle - причина простоя с числами, без которых она не проверяется: «потолок
-// израсходован» без «7 из 7» и «окно закрыто» без часа открытия заставляют
-// человека искать те же цифры руками.
+// Idle is an idle reason with the numbers that make it checkable: "cap used
+// up" without "7 of 7" and "window closed" without the opening time force a
+// human to look up the same figures by hand.
 type Idle struct {
 	Reason string
-	// Used, Limit - дневной расход аккаунта и его потолок из БД: у причины
-	// IdleDailyLimit.
+	// Used, Limit are the account daily usage and its cap from the database: set
+	// for the IdleDailyLimit reason.
 	Used  int
 	Limit int
-	// OpensAt - ближайшее открытие окна отправки: у причины IdleWindowClosed.
+	// OpensAt is the next send window opening: set for the IdleWindowClosed reason.
 	OpensAt time.Time
-	// Left - сколько строк осталось в очереди: у причины IdleQueueDisqualified.
-	// Без числа «их снимет рубеж» не проверяется по счётчикам кампании.
+	// Left is how many rows remain in the queue: set for the IdleQueueDisqualified
+	// reason. Without the number, "a gate will remove them" cannot be checked
+	// against the campaign counters.
 	Left int
-	// Braces - неразобранные скобки шаблона: у причины IdleBrokenTemplate. Отчёт
-	// подменяет их скобками показанной кампании - его строка говорит про «эту
-	// кампанию», а не про активную.
+	// Braces are the unresolved template braces: set for the IdleBrokenTemplate
+	// reason. The report replaces them with the braces of the campaign it shows -
+	// its line speaks about "this campaign", not the active one.
 	Braces []string
 }
 
-// IdleReason объясняет пустой ответ ClaimNext. Зовётся в простое и из отчёта, не
-// на каждой отправке, и рубежом не является: это диагностика, и её расхождение с
-// ClaimNext испортит лог, но не пропустит сообщение.
+// IdleReason explains an empty ClaimNext answer. It is called when idle and from
+// the report, not on every send, and is not a gate: it is diagnostics, and a
+// disagreement with ClaimNext would spoil the log but not let a message through.
 func (s *Service) IdleReason(ctx context.Context, accountLabel string) (Idle, error) {
 	now := s.Now()
 	if !s.inSendWindow(now) {
@@ -316,20 +324,20 @@ func (s *Service) IdleReason(ctx context.Context, accountLabel string) (Idle, er
 	case sendable > 0:
 		return Idle{Reason: IdleQueueBlocked}, nil
 	default:
-		// Строки есть, но уйти не может ни одна: их снимет ближайший виток
-		// выборки. Прежде этот случай назывался чужим аккаунтом - совет ждать
-		// отправщика, которого нет.
+		// Rows exist but none can go out: the next selection pass will remove
+		// them. This case used to be reported as another account - advice to wait
+		// for a sender that does not exist.
 		return Idle{Reason: IdleQueueDisqualified, Left: planned}, nil
 	}
 }
 
-// FinishClaim закрывает строку по исходу доставки - отдельной короткой
-// транзакцией уже после сетевого вызова. Стоп-лист и «получал в любой
-// кампании» здесь не перепроверяются: это рубежи ClaimNext, они стоят до
-// отправки, а не после.
+// FinishClaim closes a row by its delivery outcome - in a separate short
+// transaction after the network call. The stop list and "received in any
+// campaign" are not rechecked here: they are ClaimNext gates, which stand
+// before sending, not after.
 //
-// false без ошибки означает, что строка ушла из очереди, пока шла отправка
-// (человек ответил первым), и исход отброшен.
+// false without an error means the row left the queue while sending was in
+// progress (the person replied first), and the outcome is discarded.
 func (s *Service) FinishClaim(ctx context.Context, item *Recipient, result SendResult, reason string) (bool, error) {
 	now := s.Now()
 	if result == ResultRetryCounted {
@@ -354,15 +362,17 @@ func (s *Service) FinishClaim(ctx context.Context, item *Recipient, result SendR
 	var args []any
 	switch result {
 	case ResultSent:
-		// Доставка состоялась - факт обязан лечь в БД из любого состояния, в
-		// которое строку увели, пока шла отправка: без sent_at человек прошёл бы
-		// импорт следующей кампании и получил второе сообщение. Ответ мог
-		// обогнать запись: replied остаётся replied, но с sent_at. undelivered
-		// перекрывается доставкой: отказ мог записать первый процесс той же
-		// метки, а доставил второй, перехвативший протухший claim.
-		// tg_user_id пишется тем же запросом: ответ без ника ищется по нему.
-		// $4::bigint - явный тип: без приведения NULLIF выводит int4, и живой id
-		// Telegram больше 2^31 не кодируется вовсе.
+		// Delivery happened - the fact must land in the database from whatever
+		// state the row was moved to while sending was in progress: without
+		// sent_at the person would pass the next campaign's import and get a
+		// second message. A reply may have outrun the write: replied stays
+		// replied, but gets sent_at. undelivered is overridden by delivery: the
+		// first process with the same label may have recorded a refusal while a
+		// second one, which took over a stale claim, delivered.
+		// tg_user_id is written by the same query: a reply without a username is
+		// looked up by it.
+		// $4::bigint is an explicit type: without the cast NULLIF infers int4, and
+		// a real Telegram id above 2^31 cannot be encoded at all.
 		query = `UPDATE recipients
 			SET state = CASE WHEN state = 'replied' THEN 'replied' ELSE 'sent' END,
 			    reason = $3, sent_at = COALESCE(sent_at, $2), claimed_at = NULL,
@@ -374,11 +384,11 @@ func (s *Service) FinishClaim(ctx context.Context, item *Recipient, result SendR
 			WHERE id = $1 AND state = 'planned'`
 		args = []any{item.ID, reason}
 	case ResultRetry:
-		// Попытка не расходуется: снимаем claim и оставляем причину для лога.
-		// Исключение - отменённая кампания: её очередь уже снята, и строка,
-		// которую отмена не тронула ради живого claim, уходит в cancelled
-		// здесь. Иначе она осталась бы planned навсегда - выборка берёт только
-		// строки активной кампании.
+		// The attempt is not spent: we release the claim and keep the reason for
+		// the log. The exception is a cancelled campaign: its queue is already
+		// cleared, and a row that cancellation left alone because of a live claim
+		// goes to cancelled here. Otherwise it would stay planned forever - the
+		// selection takes only rows of the active campaign.
 		query = `UPDATE recipients AS r
 			SET state = CASE WHEN c.status = 'cancelled' THEN 'cancelled' ELSE r.state END,
 			    reason = CASE WHEN c.status = 'cancelled' THEN $3 ELSE $2 END,
@@ -397,20 +407,22 @@ func (s *Service) FinishClaim(ctx context.Context, item *Recipient, result SendR
 	return tag.RowsAffected() > 0, nil
 }
 
-// MarkReplied закрывает строки человека, который сам вступил в диалог.
-// Отправленная строка переходит в replied, ещё не отправленная - тоже, и это
-// отменяет приглашение. Строки черновика не трогаются: ему ещё не слали, а
-// replied отсеял бы человека из будущей рассылки с причиной «уже получал».
+// MarkReplied closes the rows of a person who started the conversation
+// themselves. A sent row becomes replied, and so does a not-yet-sent one, which
+// cancels the invitation. Draft rows are not touched: nothing was sent to them
+// yet, and replied would filter the person out of a future mailing with the
+// reason "already received".
 //
-// Человек узнаётся по id Telegram и по нику: короткий апдейт ника не несёт, а
-// id известен только у строк, которым уже отправляли. Оба условия в одном
-// запросе - это один и тот же человек, и обе его строки закрываются вместе.
-// $1::bigint - явный тип: сравнение с литералом вывело бы параметр в int4, и
-// живой id Telegram больше 2^31 не закодировался бы.
+// The person is identified by Telegram id and by username: a short update
+// carries no username, and the id is known only for rows that were already
+// sent. Both conditions in one query mean the same person, and both of their
+// rows are closed together.
+// $1::bigint is an explicit type: comparison with a literal would infer int4
+// for the parameter, and a real Telegram id above 2^31 would not encode.
 //
-// claimed_at не снимается: строка в работе обязана остаться в дневном счёте до
-// финализации, иначе второй процесс аккаунта возьмёт лишнюю. Из выборки строка
-// уходит и так - выборка берёт только planned.
+// claimed_at is not cleared: a row in progress must stay in the daily count
+// until finalization, otherwise a second account process would take an extra
+// one. The row leaves the selection anyway - the selection takes only planned.
 func (s *Service) MarkReplied(ctx context.Context, userID int64, username string) (int, error) {
 	name := normalizeUsername(username)
 	if name == "" && userID <= 0 {
@@ -429,16 +441,16 @@ func (s *Service) MarkReplied(ctx context.Context, userID int64, username string
 	return int(tag.RowsAffected()), nil
 }
 
-// markWroteFirst снимает с очереди человека, который написал сам до того, как
-// до него дошла очередь. Его строка не уходит в replied: он отвечал не на наше
-// письмо, и в метрике ответов кампании ему не место - именно эта метрика и есть
-// предмет теста оффера. Отправлять ему шаблон тоже нельзя: разговор уже начат
-// им самим.
+// markWroteFirst removes from the queue a person who wrote first, before their
+// turn came. Their row does not go to replied: they were not answering our
+// message, and they do not belong in the campaign reply metric - that metric is
+// exactly what the offer test measures. The template must not be sent to them
+// either: they started the conversation themselves.
 //
-// Строка с живым claim не трогается: её прямо сейчас несёт отправщик, и
-// сообщение могло уже уйти. Снимать с неё claim тем более нельзя - строка в
-// работе обязана остаться в дневном счёте до финализации, иначе второй процесс
-// аккаунта возьмёт лишнюю.
+// A row with a live claim is not touched: the sender is carrying it right now,
+// and the message may already be out. Releasing its claim is even less
+// acceptable - a row in progress must stay in the daily count until
+// finalization, otherwise a second account process would take an extra one.
 func (s *Service) markWroteFirst(ctx context.Context, userID int64, username string) (int, error) {
 	name := normalizeUsername(username)
 	if name == "" && userID <= 0 {
@@ -458,9 +470,9 @@ func (s *Service) markWroteFirst(ctx context.Context, userID int64, username str
 	return int(tag.RowsAffected()), nil
 }
 
-// inSendWindow - рубеж окна: только будни и только между границами конфига по
-// МСК. Кривое окно молчит, а не шлёт: конфиг проверен на старте, и сюда
-// ошибка разбора попасть не должна.
+// inSendWindow is the window gate: weekdays only, and only between the config
+// bounds in MSK. A malformed window stays silent instead of sending: the config
+// is validated at startup, so a parse error should not reach this point.
 func (s *Service) inSendWindow(now time.Time) bool {
 	local := now.In(moscowZone)
 	if local.Weekday() == time.Saturday || local.Weekday() == time.Sunday {
@@ -486,17 +498,17 @@ func parseClock(value string) (int, error) {
 	return point.Hour()*60 + point.Minute(), nil
 }
 
-// startOfDay - начало суток по МСК: дневной потолок считается календарным
-// днём того же пояса, что и окно отправки.
+// startOfDay is the start of the day in MSK: the daily cap counts a calendar day
+// in the same time zone as the send window.
 func startOfDay(now time.Time) time.Time {
 	local := now.In(moscowZone)
 	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, moscowZone)
 }
 
-// Отсев получателя перед отправкой. Оба условия проверяются в claim-транзакции,
-// а не только при импорте: человека вносят в стоп-лист и после загрузки списка,
-// а сообщение в соседней кампании он мог получить между импортом и своей
-// очередью.
+// Recipient screening before sending. Both conditions are checked in the claim
+// transaction, not only on import: a person is added to the stop list after the
+// list is loaded, and may have received a message in a neighboring campaign
+// between the import and their turn.
 const inStopListSQL = `EXISTS (SELECT 1 FROM stop_list s
 	WHERE s.amo_contact_id = r.amo_contact_id OR s.username = r.username)`
 
@@ -504,35 +516,36 @@ const alreadySentSQL = `EXISTS (SELECT 1 FROM recipients o
 	WHERE (o.amo_contact_id = r.amo_contact_id OR o.username = r.username)
 	  AND o.id <> r.id AND o.state IN ('sent', 'replied'))`
 
-// Ручное касание закрывает человека для кампаний наравне с отправленной
-// строкой: сообщение через tg_send в recipients не попадает, и без этого
-// условия следующая кампания напишет ему второй раз. Направление одностороннее -
-// журнал не пускает кампанию, но повторному tg_send не мешает, иначе диалог
-// обрывался бы после первой реплики. failed не считается: при таком отказе
-// сообщение заведомо не ушло.
+// A manual touch closes the person to campaigns the same way a sent row does: a
+// message sent through tg_send does not land in recipients, and without this
+// condition the next campaign would write to them a second time. The direction
+// is one-way - the log blocks a campaign but does not block a repeated tg_send,
+// otherwise a conversation would break off after the first reply. failed does
+// not count: with such a refusal the message certainly did not go out.
 //
-// Ключ один - ник: contact_id ручному касанию взять неоткуда.
+// The only key is the username: a manual touch has no contact_id to use.
 const touchedDirectSQL = `EXISTS (SELECT 1 FROM direct_messages d
 	WHERE d.username = r.username AND d.state <> 'failed')`
 
-// Причина отсева обязана отличать доставленное касание от неизвестного: pending
-// значит «сообщение могло уйти», и отчёт не имеет права называть это «уже
-// писали». Порог здесь не нужен и был бы враньём: свежий pending так же
-// неизвестен, как старый. Тот же вопрос через checkPersonSQL отвечается этим же
-// делением - два входа обязаны говорить про одного человека одно.
+// The screening reason must tell a delivered touch from an unknown one: pending
+// means "the message may have gone out", and the report must not call that
+// "already written to". A threshold is not needed here and would be a lie: a
+// fresh pending is as unknown as an old one. The same question asked through
+// checkPersonSQL is answered with this same split - two entry points must say
+// the same thing about one person.
 const sentDirectSQL = `EXISTS (SELECT 1 FROM direct_messages d
 	WHERE d.username = r.username AND d.state = 'sent')`
 
-// Снятые рубежом строки уходят в skipped, а не остаются planned: иначе очередь
-// не опустеет никогда и кампания не закроется. Строка с живым claim не
-// трогается - её прямо сейчас несёт другой процесс, и её судьбу решит
-// финализация.
+// Rows removed by a gate go to skipped rather than staying planned: otherwise
+// the queue would never empty and the campaign would never close. A row with a
+// live claim is not touched - another process is carrying it right now, and
+// finalization decides its fate.
 //
-// Служебный адресат владельца не снимается за «уже получал» и за ручное
-// касание - для него этого правила нет, - но стоп-лист снимает и его. Иначе
-// такая строка висела бы planned навсегда: в отправку её не пускает
-// sendableSQL, кампания не закрывается, а status называл бы простой
-// queue_disqualified, то есть неверной причиной.
+// An owner service recipient is not removed for "already received" or for a
+// manual touch - that rule does not apply to them - but the stop list removes
+// them too. Otherwise such a row would hang as planned forever: sendableSQL
+// does not let it go out, the campaign does not close, and status would name
+// the idle reason queue_disqualified, which is the wrong reason.
 func skipDisqualifiedSQL(owners string) string {
 	return `UPDATE recipients AS r
 	SET state = 'skipped',
@@ -549,46 +562,51 @@ func skipDisqualifiedSQL(owners string) string {
 	           AND (` + alreadySentSQL + ` OR ` + touchedDirectSQL + `)))`
 }
 
-// Рубежа пустого имени в SQL больше нет: человек без имени получает письмо без
-// обращения, и снимать его строку не за что (решение владельца 02.09.2026).
+// The empty-name gate no longer exists in SQL: a person without a name gets a
+// message without a greeting, and there is no reason to remove their row (owner
+// decision of 02.09.2026).
 
-// bracedNameSQL - фигурная скобка в имени: она уедет в письмо как есть, а это
-// тот же симптом, против которого стоит проверка шаблона.
+// bracedNameSQL matches a curly brace in a name: it would go into the message
+// as is, which is the same symptom the template check guards against.
 const bracedNameSQL = `r.name ~ '[{}]'`
 
-// skipBadNamesSQL снимает строки со скобкой в имени. Причину зовёт только
-// шаблон с {имя}, поэтому запрос идёт под тем же условием, что и claim. Длина
-// письма сюда не попадает - она зависит от шаблона и меряется в единицах
-// UTF-16, чего SQL точно не выразит; её проверяет nameFault на взятой строке.
-// Строка с живым claim не трогается - её несёт другой процесс.
+// skipBadNamesSQL removes rows with a brace in the name. Only a template with
+// {имя} calls for this reason, so the query runs under the same condition as
+// claim. The message length does not belong here - it depends on the template
+// and is measured in UTF-16 units, which SQL cannot express exactly; nameFault
+// checks it on the claimed row. A row with a live claim is not touched - another
+// process is carrying it.
 //
-// Пустое имя рубежом больше не является: письмо уходит без обращения
-// (решение владельца 02.09.2026, восстановлено 07.09.2026).
+// An empty name is no longer a gate: the message goes out without a greeting
+// (owner decision of 02.09.2026, restored on 07.09.2026).
 const skipBadNamesSQL = `UPDATE recipients AS r SET state = 'skipped', claimed_at = NULL,
 	    reason = '` + ReasonNameBraces + `'
 	WHERE r.campaign_id = $1 AND r.state = 'planned'
 	  AND ` + bracedNameSQL + `
 	  AND (r.claimed_at IS NULL OR r.claimed_at < $2)`
 
-// Условие отсева повторено в выборке намеренно: рубеж не должен зависеть от
-// того, отработал ли отсев выше. Имя идёт тем же порядком: $4 говорит, зовёт ли
-// шаблон активной кампании имя (самого шаблона в запросе не видно), и строка без
-// имени под таким шаблоном не выбирается, даже если отсев её почему-то не снял.
+// The screening condition is repeated in the selection on purpose: the gate
+// must not depend on whether the screening above ran. The name follows the same
+// order: $4 says whether the active campaign template uses the name (the
+// template itself is not visible in the query), and a row without a name under
+// such a template is not selected even if the screening somehow did not remove
+// it.
 //
-// Строка, однажды взятая аккаунтом ($3), остаётся за ним навсегда - и под
-// протухшим claim, и после возврата в очередь: повтор доставки держится на
-// random_id, а Telegram дедуплицирует его в пределах одного аккаунта. Иначе
-// временный отказ, при котором сообщение могло уйти, отдал бы строку соседнему
-// номеру и человек получил бы второе сообщение. Строка мёртвого чужого
-// аккаунта ждёт человека, и сколько таких строк - видно в status.
-// sendableSQL - строка, которую рубеж пропускает: ни стоп-листа, ни второго
-// сообщения, ни ручного касания, ни негодного имени под шаблоном с {имя} ($4).
-// Один текст на выборку и на счёт очереди в отчёте: разъехавшись, они дали бы
-// «очередь движется» там, где рубеж снимает всё до последней строки.
+// A row once claimed by an account ($3) stays with it forever - both under a
+// stale claim and after returning to the queue: redelivery relies on random_id,
+// and Telegram deduplicates it within one account. Otherwise a temporary
+// failure in which the message may have gone out would hand the row to a
+// neighboring number and the person would get a second message. A row of a dead
+// foreign account waits for a human, and status shows how many such rows exist.
+// sendableSQL is a row that the gate lets through: no stop list, no second
+// message, no manual touch, no unfit name under a template with {имя} ($4).
+// One text for the selection and for the queue count in the report: if they
+// diverged, they would say "the queue is moving" where the gate removes every
+// last row.
 //
-// Служебный адресат владельца проходит «уже получал» и «писали руками», но не
-// стоп-лист и не негодное имя: снимается правило «одно сообщение», а не рубежи,
-// которые держат человека вообще.
+// An owner service recipient passes "already received" and "written to by
+// hand", but not the stop list or an unfit name: the "one message" rule is
+// lifted, not the gates that hold a person back in general.
 func sendableSQL(owners string) string {
 	return `(NOT ` + inStopListSQL + `
 	           AND (r.username = ANY(` + owners + `)
@@ -596,9 +614,9 @@ func sendableSQL(owners string) string {
 	           AND NOT ($4 AND ` + bracedNameSQL + `))`
 }
 
-// claimSQL - выборка следующей строки. $5 - режим «только служебные адресаты»:
-// его включает закрытое окно или исчерпанный потолок, и тогда очередь движется
-// одними проверочными строками владельца.
+// claimSQL selects the next row. $5 is the "service recipients only" mode:
+// a closed window or an exhausted cap turns it on, and then the queue moves on
+// the owner's test rows alone.
 func claimSQL(owners string) string {
 	return `SELECT r.id, r.campaign_id, r.amo_contact_id, r.amo_lead_id, r.name, r.username, r.random_id
 	FROM recipients r
@@ -612,12 +630,13 @@ func claimSQL(owners string) string {
 	FOR UPDATE OF r SKIP LOCKED`
 }
 
-// idleQueueSQL - что осталось в очереди активной кампании, сколько из этого
-// вообще может уйти и сколько доступно нашему аккаунту прямо сейчас. Отсев
-// повторяется целиком, а не грубо: строка, которую снимет рубеж, доступной не
-// является, и отчёт, посчитавший её, обещает движение очереди, которого не
-// будет. Длина письма сюда не попадает - она зависит от шаблона и меряется в
-// UTF-16, чего SQL не выразит; такие строки снимает nameFault на витке выборки.
+// idleQueueSQL counts what remains in the active campaign queue, how much of it
+// can go out at all, and how much is available to our account right now. The
+// screening is repeated in full, not roughly: a row that a gate removes is not
+// available, and a report that counted it would promise queue movement that
+// will not happen. The message length does not belong here - it depends on the
+// template and is measured in UTF-16, which SQL cannot express; nameFault
+// removes such rows on a selection pass.
 func idleQueueSQL(owners string) string {
 	return `SELECT count(*),
 	count(*) FILTER (WHERE ` + sendableSQL(owners) + `),
@@ -628,48 +647,48 @@ func idleQueueSQL(owners string) string {
 	WHERE r.campaign_id = $1 AND r.state = 'planned'`
 }
 
-// usedTodaySQL - дневной расход аккаунта целиком: кампанийные отправки плюс
-// холодные ручные касания за сегодня ($1 - начало суток, $2 - граница протухания
-// claim). Потолок общий на оба канала: инвариант говорит «дневной потолок держит
-// рассылку и первое касание незнакомца», и односторонний счёт давал бы два
-// потолка за сутки с одного номера.
+// usedTodaySQL is the full daily usage of an account: campaign sends plus cold
+// manual touches today ($1 is the start of the day, $2 the claim staleness
+// bound). The cap is shared by both channels: the invariant says "the daily cap
+// covers the mailing and the first touch of a stranger", and a one-sided count
+// would allow two caps per day from one number.
 //
-// account - как назван аккаунт в запросе: $3 у рубежа, a.id у отчёта. Сумма одна
-// на оба, и разъехаться им теперь нечем.
+// account is how the account is named in the query: $3 in the gate, a.id in the
+// report. The sum is the same for both, so they can no longer diverge.
 //
-// Сообщения служебным адресатам в расход не входят ни в одном из подзапросов:
-// потолок стоит ради незнакомых людей, и проверка рассылки на аккаунт владельца
-// не имеет права его тратить. Сколько ушло им - показывает status отдельной
-// строкой.
+// Messages to service recipients are excluded from usage in every subquery: the
+// cap exists for strangers, and a mailing check on the owner's account must not
+// spend it. How many went to them is shown by status on a separate line.
 func usedTodaySQL(account, owners string) string {
 	return `(SELECT count(*) FROM recipients r
 		WHERE r.account_id = ` + account + ` AND r.username <> ALL(` + owners + `) AND ` + dailyUsedSQL + `)
 		+ ` + coldDirectSQL(account, owners)
 }
 
-// coldDirectSQL - холодные ручные касания аккаунта за сегодня ($1 - начало
-// суток). Входят в потолок наравне с рассылкой, поэтому живут внутри
-// usedTodaySQL; отдельно отчёт показывает их той же строкой, а не своей.
+// coldDirectSQL counts the account's cold manual touches today ($1 is the start
+// of the day). They count toward the cap like the mailing, so they live inside
+// usedTodaySQL; the report shows them on the same line, not on a line of their own.
 func coldDirectSQL(account, owners string) string {
 	return `(SELECT count(*) FROM direct_messages d
 		WHERE d.account_id = ` + account + ` AND d.username <> ALL(` + owners + `)
 		  AND d.cold AND d.state <> 'failed' AND d.created_at >= $1)`
 }
 
-// dailyUsedSQL - кампанийная часть расхода: отправленное с начала суток ($1)
-// плюс живые claims ($2 - граница протухания). Один текст на рубеж потолка и на
-// отчёт: разъехавшись, status показывал бы «29 из 30» там, где ClaimNext уже
-// отказывает.
+// dailyUsedSQL is the campaign part of the usage: what was sent since the start
+// of the day ($1) plus live claims ($2 is the staleness bound). One text for the
+// cap gate and for the report: if they diverged, status would show "29 of 30"
+// where ClaimNext already refuses.
 //
-// Состояние строки в живом claim не проверяется намеренно: строка, взятая
-// отправщиком, остаётся в счёте, чем бы её ни сделал параллельный ответ
-// человека. Условие state = 'planned' открывало бы дыру в потолке на каждом
-// replied до финализации.
+// The row state under a live claim is deliberately not checked: a row taken by
+// the sender stays in the count whatever a parallel reply from the person makes
+// of it. A state = 'planned' condition would open a hole in the cap on every
+// replied row before finalization.
 const dailyUsedSQL = `(r.sent_at >= $1 OR (r.claimed_at >= $2 AND r.sent_at IS NULL))`
 
-// countedRetrySQL - временный отказ с расходом попытки: на исчерпании бюджета
-// строка уходит из очереди, иначе стабильная неопознанная ошибка держит её
-// голову. Отменённая кампания разбирается здесь же, как и в обычном retry.
+// countedRetrySQL handles a temporary failure that spends an attempt: when the
+// budget runs out the row leaves the queue, otherwise a stable unrecognized
+// error holds its head. A cancelled campaign is handled here too, as in a plain
+// retry.
 const countedRetrySQL = `UPDATE recipients AS r
 	SET attempts = r.attempts + 1,
 	    state = CASE

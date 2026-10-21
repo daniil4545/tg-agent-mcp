@@ -19,33 +19,35 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/telegram"
 )
 
-// Service - доменные операции кампании и очереди поверх пула. Состояния в
-// памяти нет вовсе: счётчики, паузы и стопы переживают перезапуск только в БД.
+// Service holds the domain operations of the campaign and the queue on top of
+// the pool. There is no in-memory state at all: counters, pauses and stops
+// survive a restart only in the database.
 type Service struct {
 	pool *pgxpool.Pool
 	cfg  Config
 
-	// owners - служебные адресаты множеством: единственный источник ответа
-	// isOwner.
+	// owners is the set of service recipients: the single source of the isOwner
+	// answer.
 	owners map[string]bool
 
-	// Запросы с рубежами собираются один раз здесь, потому что список служебных
-	// адресатов входит в них SQL-литералом, а не параметром. Параметр-массив не
-	// годится: nil-слайс pgx кодирует как NULL, и `x <> ALL(NULL)` дал бы NULL -
-	// потолок считался бы нулём, а отсев вешал бы строки в planned. Литерал
-	// безопасен: форму ника проверил LoadConfig.
+	// Queries with guards are built once here, because the list of service
+	// recipients enters them as an SQL literal, not as a parameter. An array
+	// parameter does not work: pgx encodes a nil slice as NULL, and
+	// `x <> ALL(NULL)` would give NULL - the cap would count as zero and the
+	// filtering would leave rows hanging in planned. The literal is safe:
+	// LoadConfig has checked the username shape.
 	accountUsedSQL      string
 	claimSQL            string
 	idleQueueSQL        string
 	skipDisqualifiedSQL string
 	accountsReportSQL   string
 
-	// Now - источник времени. Поле, а не time.Now по месту: окно отправки и
-	// протухание claim иначе непроверяемы тестом.
+	// Now is the time source. A field rather than time.Now in place: otherwise
+	// the send window and claim expiry cannot be tested.
 	Now func() time.Time
 }
 
-// NewService собирает сервис на открытом пуле.
+// NewService builds a service on an open pool.
 func NewService(pool *pgxpool.Pool, cfg Config) *Service {
 	owners := ownersLiteral(cfg.OwnerAccounts)
 	s := &Service{
@@ -59,8 +61,8 @@ func NewService(pool *pgxpool.Pool, cfg Config) *Service {
 		accountsReportSQL:   accountsReportSQL(owners),
 		Now:                 time.Now,
 	}
-	// Тот же отбор, что в ownersLiteral: разъехавшись, Go и SQL сняли бы рубежи
-	// с разных людей.
+	// The same selection as in ownersLiteral: if they drifted apart, Go and SQL
+	// would lift the guards for different people.
 	for _, name := range cfg.OwnerAccounts {
 		if telegram.IsUsername(name) {
 			s.owners[name] = true
@@ -69,24 +71,24 @@ func NewService(pool *pgxpool.Pool, cfg Config) *Service {
 	return s
 }
 
-// isOwner - служебный ли это адресат: единственная точка проверки в Go. Ник
-// нормализуется так же, как при импорте списка, иначе «@Smirnov» и «smirnov»
-// разошлись бы на рубежах.
+// isOwner reports whether this is a service recipient: the single check point
+// in Go. The username is normalized the same way as on list import, otherwise
+// "@Smirnov" and "smirnov" would diverge at the guards.
 func (s *Service) isOwner(username string) bool {
 	return s.owners[normalizeName(username)]
 }
 
-// ownerNames - служебные адресаты для отчёта, в неизменном порядке. Отчёт
-// называет тех, кого рубежи действительно не держат, поэтому берёт их из того
-// же множества, что и isOwner, а не из строки настроек.
+// ownerNames returns the service recipients for the report, in a stable order.
+// The report names those the guards really do not hold, so it takes them from
+// the same set as isOwner, not from the settings string.
 func (s *Service) ownerNames() []string {
 	return slices.Sorted(maps.Keys(s.owners))
 }
 
-// DigestRecipients - кому уходит вечерняя сводка: DIGEST_TO, если он задан,
-// иначе все служебные адресаты, как было до разделения списков. Списки разные,
-// потому что DEV_ALLOW_LIST снимает рубежи для проверок рассылки и сузить его
-// до двух получателей отчёта нельзя.
+// DigestRecipients returns who gets the evening digest: DIGEST_TO if set,
+// otherwise all service recipients, as before the lists were split. The lists
+// differ because DEV_ALLOW_LIST lifts the guards for mailing checks and cannot
+// be narrowed down to the two report readers.
 func (s *Service) DigestRecipients() []string {
 	if len(s.cfg.DigestTo) > 0 {
 		return s.cfg.DigestTo
@@ -94,13 +96,14 @@ func (s *Service) DigestRecipients() []string {
 	return s.ownerNames()
 }
 
-// ownersLiteral - список служебных адресатов SQL-литералом для сборки
-// запросов; пустой список даёт ARRAY[]::text[], на котором `<> ALL` истинно, а
-// `= ANY` ложно, то есть поведение сервиса неотличимо от прежнего.
+// ownersLiteral renders the list of service recipients as an SQL literal for
+// building queries; an empty list gives ARRAY[]::text[], on which `<> ALL` is
+// true and `= ANY` is false, so the service behaves exactly as before.
 //
-// Форма ника проверяется здесь повторно после LoadConfig: замок стоит там, где
-// строка склеивается с запросом, а не за двести строк от него. NewService
-// принимает Config, собранный кем угодно, и кавычка в нике переписала бы WHERE.
+// The username shape is checked again here after LoadConfig: the lock sits
+// where the string is glued into the query, not two hundred lines away.
+// NewService accepts a Config built by anyone, and a quote in a username would
+// rewrite the WHERE clause.
 func ownersLiteral(list []string) string {
 	quoted := make([]string, 0, len(list))
 	for _, name := range list {
@@ -115,38 +118,41 @@ func ownersLiteral(list []string) string {
 	return `ARRAY[` + strings.Join(quoted, ",") + `]::text[]`
 }
 
-// maxBatch - потолок пачки add_recipients. Причина не в базе, а в клиенте:
-// большой tool-аргумент у Клода обрезается молча.
+// maxBatch is the cap on an add_recipients batch. The reason is not the
+// database but the client: a large tool argument is silently truncated on the
+// model side.
 const maxBatch = 50
 
-// Причины отсева и снятия строки. Список закрытый: новая строка здесь -
-// новое решение сервиса, а не новый текст в отчёте.
+// Reasons for filtering out or removing a row. The list is closed: a new entry
+// here is a new service decision, not new text in the report.
 const (
-	ReasonBadContact   = "bad_contact"    // нет идентификатора контакта amoCRM
-	ReasonNoUsername   = "no_username"    // ник пустой или непохож на ник
-	ReasonNoName       = "no_name"        // больше не выставляется, встречается в кампаниях до 07.09.2026
-	ReasonTextTooLong  = "text_too_long"  // письмо с его именем длиннее предела Telegram
-	ReasonNameBraces   = "name_braces"    // в имени фигурная скобка: она уедет в письмо
-	ReasonDuplicate    = "duplicate"      // контакт или ник уже в этой кампании
-	ReasonStopList     = "stop_list"      // человек в стоп-листе
-	ReasonAlreadySent  = "already_sent"   // получал сообщение в любой кампании
-	ReasonCampaignGone = "campaign_ended" // кампания отменена вместе с очередью
+	ReasonBadContact   = "bad_contact"    // no amoCRM contact id
+	ReasonNoUsername   = "no_username"    // username is empty or does not look like one
+	ReasonNoName       = "no_name"        // no longer set, found in campaigns before 07.09.2026
+	ReasonTextTooLong  = "text_too_long"  // the message with his name exceeds the Telegram limit
+	ReasonNameBraces   = "name_braces"    // the name has a curly brace: it would go into the message
+	ReasonDuplicate    = "duplicate"      // contact or username is already in this campaign
+	ReasonStopList     = "stop_list"      // the person is on the stop list
+	ReasonAlreadySent  = "already_sent"   // received a message in any campaign
+	ReasonCampaignGone = "campaign_ended" // the campaign was cancelled together with its queue
 
-	// Ручное касание через tg_send закрывает человека для кампаний так же, как
-	// отправленная строка. Причин две, потому что журнал знает про доставку
-	// не всегда: pending значит «сообщение могло уйти», и отчёт отсева не
-	// имеет права выдавать это за состоявшуюся отправку.
-	ReasonDirectSent    = "direct_sent"    // писали руками, доставка подтверждена
-	ReasonDirectPending = "direct_pending" // писали руками, доставка неизвестна
+	// A manual touch through tg_send closes the person to campaigns just like a
+	// sent row. There are two reasons because the journal does not always know
+	// about delivery: pending means "the message may have gone out", and the
+	// filtering report must not present that as a completed send.
+	ReasonDirectSent    = "direct_sent"    // written by hand, delivery confirmed
+	ReasonDirectPending = "direct_pending" // written by hand, delivery unknown
 
-	// Человек написал сам до того, как до него дошла очередь: шаблон поверх
-	// начатого им разговора не уходит, но ответом на письмо это не считается.
+	// The person wrote first, before the queue reached them: the template is not
+	// sent over a conversation they started, but this does not count as a reply
+	// to our message.
 	ReasonWroteFirst = "wrote_first"
 )
 
-// Отказы по состоянию кампаний. Их пять, а не один: «подходящей кампании нет»
-// одинаково звучало и там, где создавать нечего, и там, где кампания жива, -
-// и совет «создайте черновик» уводил от того, что происходит.
+// Refusals by campaign state. There are several, not one: "no suitable
+// campaign" sounded the same where there is nothing to create and where a
+// campaign is alive, and the advice "create a draft" led away from what is
+// actually going on.
 var (
 	ErrBatchTooBig     = errors.New("batch is limited to 50 people")
 	ErrNoDraft         = errors.New("no draft campaign to add recipients to")
@@ -162,11 +168,11 @@ var (
 	ErrTemplateTooLong    = errors.New("rendered message does not fit the telegram limit")
 )
 
-// badTemplate - шаблон с неразобранными скобками. Куски текста вокруг них едут
-// внутри отказа: без них человек ищет опечатку глазами по всему шаблону. total -
-// сколько мест нашлось всего: показываются не все.
-// stored - шаблон уже лежит в БД: совет тогда другой, потому что шаблон
-// существующей кампании не правит ни один инструмент.
+// badTemplate is a template with unparsed braces. Pieces of text around them
+// travel inside the refusal: without them a person hunts for the typo across
+// the whole template. total is how many spots were found in all: not all are
+// shown. stored means the template is already in the database: the advice then
+// differs, because no tool edits the template of an existing campaign.
 type badTemplate struct {
 	spots  []string
 	total  int
@@ -179,8 +185,9 @@ func (e *badTemplate) Error() string {
 
 func (e *badTemplate) Unwrap() error { return ErrUnknownPlaceholder }
 
-// longTemplate - шаблон, не влезающий в сообщение вместе с именем. Числа едут
-// внутри: без них совет «сократите» не говорит, насколько.
+// longTemplate is a template that does not fit into a message together with
+// the name. The numbers travel inside: without them the advice "shorten it"
+// does not say by how much.
 type longTemplate struct{ used, limit, budget int }
 
 func (e *longTemplate) Error() string {
@@ -189,22 +196,22 @@ func (e *longTemplate) Error() string {
 
 func (e *longTemplate) Unwrap() error { return ErrTemplateTooLong }
 
-// nearCampaign - живая кампания рядом с отказом. Едет внутри ошибки, потому что
-// от неё зависит следующий шаг: «черновика нет» на пустой системе и «черновика
-// нет» при идущей кампании разрешаются по-разному.
+// nearCampaign is a live campaign next to a refusal. It travels inside the
+// error because the next step depends on it: "no draft" on an empty system and
+// "no draft" with a running campaign are resolved differently.
 type nearCampaign struct {
 	err    error
 	id     int64
 	title  string
 	status string
-	// draft - черновик рядом с найденной кампанией; 0, если его нет. Нужен
-	// совету: start берёт черновик раньше паузы, и cancel бьёт по нему раньше
-	// паузы, поэтому «продолжите start» при живом черновике отправляет агента не
-	// туда.
+	// draft is the draft next to the found campaign; 0 if there is none. The
+	// advice needs it: start takes the draft before a pause, and cancel hits it
+	// before a pause, so "continue with start" with a live draft sends the agent
+	// the wrong way.
 	draft int64
-	// pauses - сколько кампаний стоит на паузе. Тоже нужен совету: при двух
-	// паузах без черновика start отказывает как ErrManyCampaigns, и обещание
-	// «продолжит start» было бы враньём.
+	// pauses is how many campaigns are on pause. The advice needs it too: with
+	// two pauses and no draft, start refuses with ErrManyCampaigns, and the
+	// promise "start will continue it" would be a lie.
 	pauses int
 }
 
@@ -214,15 +221,16 @@ func (e *nearCampaign) Error() string {
 
 func (e *nearCampaign) Unwrap() error { return e.err }
 
-// rowQuerier - общая часть пула и транзакции: соседнюю кампанию ищут и снаружи
-// транзакции (add_recipients), и внутри неё (stop).
+// rowQuerier is the common part of the pool and a transaction: the neighbouring
+// campaign is looked up both outside a transaction (add_recipients) and inside
+// one (stop).
 type rowQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// withNear навешивает на отказ первую кампанию в одном из названных состояний;
-// порядок состояний задаёт приоритет ответа. Такой кампании нет - отказ уходит
-// как есть.
+// withNear attaches to a refusal the first campaign in one of the named
+// statuses; the order of statuses sets the answer priority. If there is no such
+// campaign, the refusal goes out as is.
 func withNear(ctx context.Context, q rowQuerier, err error, statuses ...string) error {
 	near := nearCampaign{err: err}
 	scanErr := q.QueryRow(ctx,
@@ -243,8 +251,8 @@ func withNear(ctx context.Context, q rowQuerier, err error, statuses ...string) 
 	}
 }
 
-// Person - строка входного списка. Список собирает агент своим доступом к
-// amoCRM: сам сервис в CRM не ходит.
+// Person is a row of the input list. The agent builds the list through its own
+// access to amoCRM: the service itself does not call the CRM.
 type Person struct {
 	ContactID int64
 	LeadID    int64
@@ -252,26 +260,27 @@ type Person struct {
 	Username  string
 }
 
-// BatchReport - итог пачки: сколько принято и сколько отсеяно по каждой
-// причине. Отсев - не ошибка: владелец сверяет отчёт перед стартом, а повтор
-// пачки после таймаута обязан пройти без падения.
+// BatchReport is the result of a batch: how many were accepted and how many
+// filtered out for each reason. Filtering is not an error: the owner checks
+// the report before the start, and a retry of a batch after a timeout must go
+// through without failing.
 type BatchReport struct {
 	Accepted int
 	Skipped  map[string]int
 }
 
-// LoadCampaign создаёт новый черновик, отменяя прежний одной транзакцией.
-// Гонку двух вызовов разрешает частичный уникальный индекс на draft: второй
-// вызов падает на индексе, а не оставляет два черновика.
+// LoadCampaign creates a new draft, cancelling the previous one in the same
+// transaction. A race of two calls is resolved by a partial unique index on
+// draft: the second call fails on the index instead of leaving two drafts.
 func (s *Service) LoadCampaign(ctx context.Context, template, title string) (int64, error) {
 	template = strings.TrimSpace(template)
 	title = strings.TrimSpace(title)
 	if template == "" || title == "" {
 		return 0, errors.New("campaign title and template must not be empty")
 	}
-	// Шаблон проверяется на входе, а не при отправке: кампания собирается один
-	// раз и уходит сотням, и опечатка в подстановке или лишняя тысяча символов
-	// обязаны отбиться до того, как собран список.
+	// The template is checked on input, not at send time: a campaign is built
+	// once and goes out to hundreds, and a typo in a placeholder or an extra
+	// thousand characters must be rejected before the list is assembled.
 	if spots, total := badBraces(template); total > 0 {
 		return 0, &badTemplate{spots: spots, total: total}
 	}
@@ -302,17 +311,18 @@ func (s *Service) LoadCampaign(ctx context.Context, template, title string) (int
 	return id, nil
 }
 
-// AddRecipients добавляет пачку в черновик и возвращает отчёт отсева.
-// Отсеиваются: кривой контакт, непригодный ник, дубль внутри пачки и против
-// уже вставленных, стоп-лист, «получал в любой кампании». Повтор той же пачки
-// после таймаута идемпотентен - все записи уходят в дубли.
+// AddRecipients adds a batch to the draft and returns the filtering report.
+// Filtered out are: a bad contact, an unusable username, a duplicate within the
+// batch and against those already inserted, the stop list, "received in any
+// campaign". A retry of the same batch after a timeout is idempotent - all
+// entries land in duplicates.
 func (s *Service) AddRecipients(ctx context.Context, campaignID int64, people []Person) (BatchReport, error) {
 	report := BatchReport{Skipped: map[string]int{}}
 	if len(people) > maxBatch {
 		return report, fmt.Errorf("%w: got %d", ErrBatchTooBig, len(people))
 	}
 
-	// Отсев по форме - до транзакции: база в нём не участвует.
+	// Filtering by shape comes before the transaction: the database takes no part.
 	type candidate struct {
 		person   Person
 		username string
@@ -351,8 +361,9 @@ func (s *Service) AddRecipients(ctx context.Context, campaignID int64, people []
 		if status != "draft" {
 			return fmt.Errorf("%w: campaign is %s", ErrNotDraft, status)
 		}
-		// Сломанный шаблон отбивается здесь же: иначе в негодный черновик можно
-		// набить пятьсот человек и узнать о непригодности только на start.
+		// A broken template is rejected here too: otherwise five hundred people
+		// could be stuffed into an unusable draft and the problem found only at
+		// start.
 		if spots, total := badBraces(template); total > 0 {
 			return &badTemplate{spots: spots, total: total, stored: true}
 		}
@@ -364,9 +375,9 @@ func (s *Service) AddRecipients(ctx context.Context, campaignID int64, people []
 			if err != nil {
 				return fmt.Errorf("check person %d: %w", item.person.ContactID, err)
 			}
-			// Служебному адресату владельца пишут повторно намеренно: правило
-			// «один человек - одно сообщение» стоит ради незнакомых людей.
-			// Стоп-лист и дубль внутри кампании остаются и на нём.
+			// The owner's service recipient is written to repeatedly on purpose: the
+			// "one person, one message" rule exists for strangers. The stop list
+			// and a duplicate within the campaign still apply to them.
 			if s.isOwner(item.username) {
 				alreadySent, directSent, directPending = false, false, false
 			}
@@ -388,16 +399,17 @@ func (s *Service) AddRecipients(ctx context.Context, campaignID int64, people []
 				continue
 			}
 
-			// Рубежи имени стоят после общих: человека из стоп-листа отчёт обязан
-			// назвать стоп-листом (инвариант 4), а не отсутствием имени - иначе
-			// самый сильный рубеж в отчёте импорта не виден вовсе.
+			// Name guards come after the general ones: a person on the stop list must
+			// be reported as stop list (invariant 4), not as a missing name -
+			// otherwise the strongest guard is not visible in the import report at
+			// all.
 			if fault := nameFault(template, item.name); fault != "" {
 				report.Skipped[fault]++
 				continue
 			}
 
-			// ON CONFLICT держит повтор пачки, обогнавший проверку выше:
-			// вставка не должна ронять всю загрузку из-за одного дубля.
+			// ON CONFLICT covers a batch retry that outran the check above: the
+			// insert must not fail the whole load because of a single duplicate.
 			tag, err := tx.Exec(ctx,
 				`INSERT INTO recipients (campaign_id, amo_contact_id, amo_lead_id, name, username, state, random_id)
 				 VALUES ($1, $2, $3, $4, $5, 'planned', $6)
@@ -421,15 +433,16 @@ func (s *Service) AddRecipients(ctx context.Context, campaignID int64, people []
 	return report, nil
 }
 
-// checkPersonSQL отвечает рубежами импорта одним заходом: стоп-лист, «получал в
-// любой кампании», «уже в этой кампании» и ручное касание через tg_send.
-// Человек узнаётся и по контакту amoCRM, и по нику: один человек заводится в CRM
-// дважды. У журнала ключ только ник - contact_id ручному касанию взять неоткуда.
+// checkPersonSQL answers the import guards in one pass: the stop list,
+// "received in any campaign", "already in this campaign" and a manual touch
+// through tg_send. A person is recognised both by the amoCRM contact and by
+// username: one person gets created twice in the CRM. The journal is keyed by
+// username only - a manual touch has no contact_id to take.
 //
-// Касание разложено на два флага, а не на один: pending и sent закрывают
-// человека одинаково, но называются в отчёте по-разному, и вывести одно из
-// другого нечем. Порог протухания здесь не нужен - любой pending значит
-// «доставка неизвестна», и импорт обязан сказать именно это.
+// The touch is split into two flags rather than one: pending and sent close the
+// person the same way but are named differently in the report, and one cannot
+// be derived from the other. No expiry threshold is needed here - any pending
+// means "delivery unknown", and the import must say exactly that.
 const checkPersonSQL = `SELECT
 	EXISTS (SELECT 1 FROM stop_list WHERE amo_contact_id = $1 OR username = $2),
 	EXISTS (SELECT 1 FROM recipients
@@ -439,18 +452,18 @@ const checkPersonSQL = `SELECT
 	EXISTS (SELECT 1 FROM direct_messages WHERE username = $2 AND state = 'sent'),
 	EXISTS (SELECT 1 FROM direct_messages WHERE username = $2 AND state = 'pending')`
 
-// StartCampaign переводит черновик или приостановленную кампанию в active.
-// Отдельного инструмента продолжения нет: start работает и из draft, и из
-// stopped. Когда есть и черновик, и пауза, запускается черновик: новый список
-// свежее возобновления, а пауза остаётся stopped и продолжается следующим
-// start. Пустой черновик не запускается - отправлять некому.
+// StartCampaign moves a draft or a paused campaign to active. There is no
+// separate resume tool: start works from both draft and stopped. When both a
+// draft and a pause exist, the draft starts: a new list is fresher than a
+// resume, and the pause stays stopped and is continued by the next start. An
+// empty draft does not start - there is nobody to send to.
 func (s *Service) StartCampaign(ctx context.Context) (int64, error) {
 	now := s.Now()
 	var id int64
 	err := db.InTx(ctx, s.pool, func(tx pgx.Tx) error {
-		// Активная кампания в системе одна, и держит это частичный индекс.
-		// Проверка стоит до запуска, чтобы оператор получил внятный отказ, а не
-		// текст нарушения уникального индекса от Postgres.
+		// There is one active campaign in the system, enforced by a partial index.
+		// The check comes before the start so the operator gets a clear refusal
+		// rather than the Postgres unique index violation text.
 		active, err := findCampaign(ctx, tx, "active")
 		if err != nil {
 			return err
@@ -483,8 +496,9 @@ func (s *Service) StartCampaign(ctx context.Context) (int64, error) {
 			return fmt.Errorf("read campaigns: %w", err)
 		}
 
-		// Черновик в системе один (частичный индекс), пауз может быть несколько:
-		// черновик побеждает, а неразличимые паузы разбирает человек.
+		// There is one draft in the system (partial index), there may be several
+		// pauses: the draft wins, and indistinguishable pauses are sorted out by
+		// a human.
 		target := row{}
 		for _, item := range found {
 			if item.status == "draft" {
@@ -502,10 +516,11 @@ func (s *Service) StartCampaign(ctx context.Context) (int64, error) {
 			return ErrManyCampaigns
 		}
 
-		// Шаблон перепроверяется и здесь: кампания могла быть собрана прошлой
-		// версией, где «{{имя}}» проходил вход. Отказ на старте - ради человека,
-		// сам рубеж стоит в ClaimNext: туда приходит и кампания, ставшая active до
-		// обновления, а через start она больше не проходит.
+		// The template is rechecked here too: the campaign could have been built
+		// by a previous version where "{{имя}}" passed input. The refusal at start
+		// is for the human; the guard itself sits in ClaimNext: a campaign that
+		// became active before an update arrives there too, while it no longer
+		// passes through start.
 		if spots, total := badBraces(target.template); total > 0 {
 			return &badTemplate{spots: spots, total: total, stored: true}
 		}
@@ -536,11 +551,11 @@ func (s *Service) StartCampaign(ctx context.Context) (int64, error) {
 	return id, nil
 }
 
-// StopCampaign ставит кампанию на паузу или отменяет её и возвращает id
-// затронутой кампании. Пауза возможна только из active; отмена бьёт по одной
-// кампании в порядке active, draft, stopped. Черновик идёт раньше паузы, чтобы
-// пара «пауза плюс черновик» была разрешима инструментами: первая отмена
-// снимает черновик, вторая - паузу, и ни одна не уносит обе.
+// StopCampaign pauses a campaign or cancels it and returns the id of the
+// affected campaign. Pause is possible only from active; cancel hits one
+// campaign in the order active, draft, stopped. The draft goes before the pause
+// so that the pair "pause plus draft" is resolvable with the tools: the first
+// cancel removes the draft, the second the pause, and neither takes both.
 func (s *Service) StopCampaign(ctx context.Context, cancel bool) (int64, error) {
 	now := s.Now()
 	var id int64
@@ -569,9 +584,9 @@ func (s *Service) StopCampaign(ctx context.Context, cancel bool) (int64, error) 
 		err := tx.QueryRow(ctx,
 			`UPDATE campaigns SET status = 'stopped' WHERE status = 'active' RETURNING id`).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Паузу и черновик называет отказ: повтор stop на уже приостановленной
-			// кампании иначе читается как «кампании больше нет», хотя её продолжает
-			// start.
+			// The refusal names the pause and the draft: a repeated stop on an
+			// already paused campaign would otherwise read as "the campaign is
+			// gone", although start continues it.
 			return withNear(ctx, tx, ErrNothingToStop, "stopped", "draft")
 		}
 		if err != nil {
@@ -585,9 +600,9 @@ func (s *Service) StopCampaign(ctx context.Context, cancel bool) (int64, error) 
 	return id, nil
 }
 
-// FinishIfEmpty закрывает активную кампанию, когда planned-строк не осталось.
-// Взятая отправщиком строка тоже planned: кампания не закрывается, пока хоть
-// одна строка в работе.
+// FinishIfEmpty closes the active campaign when no planned rows are left. A row
+// taken by a sender is also planned: the campaign does not close while at least
+// one row is in progress.
 func (s *Service) FinishIfEmpty(ctx context.Context) (bool, error) {
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE campaigns SET status = 'done', finished_at = $1
@@ -600,9 +615,9 @@ func (s *Service) FinishIfEmpty(ctx context.Context) (bool, error) {
 	return tag.RowsAffected() > 0, nil
 }
 
-// findCampaign отдаёт id первой кампании в названном состоянии под блокировкой
-// строки; 0 - такой кампании нет. Блокировка нужна отмене и старту: решение
-// принимается по тому же состоянию, которое потом меняется.
+// findCampaign returns the id of the first campaign in the named status under a
+// row lock; 0 means there is no such campaign. Cancel and start need the lock:
+// the decision is made on the same state that is changed afterwards.
 func findCampaign(ctx context.Context, tx pgx.Tx, status string) (int64, error) {
 	var id int64
 	err := tx.QueryRow(ctx,
@@ -617,13 +632,15 @@ func findCampaign(ctx context.Context, tx pgx.Tx, status string) (int64, error) 
 	return id, nil
 }
 
-// cancelCampaign отменяет одну кампанию вместе с её очередью. Строки снимаются
-// первыми: после смены статуса кампании их уже не найти по этому условию.
+// cancelCampaign cancels one campaign together with its queue. The rows are
+// removed first: after the campaign status changes they can no longer be found
+// by this condition.
 //
-// Строка с живым claim не трогается: её прямо сейчас несёт отправщик, и отмена
-// её состояния потеряла бы факт отправки - финализация такую строку уже не
-// нашла бы. Её судьбу решает FinishClaim: доставленная уходит в sent, а
-// временный отказ по отменённой кампании - в cancelled.
+// A row with a live claim is left alone: a sender is carrying it right now, and
+// cancelling its state would lose the fact of sending - finalization would no
+// longer find such a row. Its fate is decided by FinishClaim: a delivered one
+// goes to sent, and a temporary failure on a cancelled campaign goes to
+// cancelled.
 func cancelCampaign(ctx context.Context, tx pgx.Tx, campaignID int64, now, stale time.Time) error {
 	if _, err := tx.Exec(ctx,
 		`UPDATE recipients SET state = 'cancelled', reason = $3, claimed_at = NULL
@@ -640,32 +657,36 @@ func cancelCampaign(ctx context.Context, tx pgx.Tx, campaignID int64, now, stale
 	return nil
 }
 
-// staleBefore - граница протухания claim: раньше неё строку никто уже не несёт.
+// staleBefore is the claim expiry boundary: before it nobody is carrying the row any more.
 func (s *Service) staleBefore(now time.Time) time.Time {
 	return now.Add(-s.cfg.ClaimStaleAfter)
 }
 
-// namePlaceholder - единственная подстановка шаблона. Кампания без неё законна,
-// но получатель без имени в кампанию с ней не попадает.
+// namePlaceholder is the only template substitution. A campaign without it is
+// legal, but a recipient without a name does not enter a campaign that uses it.
+// It is Russian because the message templates are Russian text.
 const namePlaceholder = "{имя}"
 
-// nameBudget - запас символов на имя при проверке длины шаблона: имя заранее
-// неизвестно, а узнать о непролезающем сообщении на старте рассылки поздно.
+// nameBudget is the character allowance for a name when checking template
+// length: the name is unknown in advance, and learning about a message that
+// does not fit at mailing start is too late.
 const nameBudget = 64
 
-// namePlaceholderPattern - единственная подстановка, которую сервис понимает:
-// регистр не важен, пробелы внутри скобок допустимы. «{Имя}» в начале
-// предложения - естественная опечатка, и уходить в письмо литералом она не
-// должна.
+// namePlaceholderPattern matches the only substitution the service understands:
+// case does not matter, spaces inside the braces are allowed. "{Имя}" at the
+// start of a sentence is a natural typo, and it must not go into the message
+// literally.
 var namePlaceholderPattern = regexp.MustCompile(`(?i)\{\s*имя\s*\}`)
 
-// RenderMessage подставляет имя в шаблон. Замена литеральная: имя приходит из
-// CRM, и «$1» в нём не имеет права раскрыться в кусок совпадения.
+// RenderMessage substitutes the name into the template. The replacement is
+// literal: the name comes from the CRM, and "$1" in it must not expand into a
+// piece of the match.
 //
-// Пустое имя не отсеивает человека, а убирает обращение целиком: «{имя}, текст»
-// становится «текст», «Привет, {имя}!» - «Привет!». Иначе письмо начиналось бы
-// с запятой. Регистр первой буквы не правится намеренно: текст заказчика
-// сервис не переписывает, а читаемость обеих форм проверяется при утверждении.
+// An empty name does not filter the person out but removes the address
+// entirely: "{имя}, текст" becomes "текст", "Привет, {имя}!" becomes
+// "Привет!". Otherwise the message would start with a comma. The case of the
+// first letter is deliberately not fixed: the service does not rewrite the
+// caller's text, and the readability of both forms is checked at approval.
 func RenderMessage(template, name string) string {
 	clean := cleanName(name)
 	if clean == "" {
@@ -674,15 +695,16 @@ func RenderMessage(template, name string) string {
 	return namePlaceholderPattern.ReplaceAllLiteralString(template, clean)
 }
 
-// namePlaceholderAfterComma и namePlaceholderBeforeComma - подстановка вместе с
-// прилипшей к ней запятой. Разделены на две замены, потому что запятая стоит с
-// той стороны, с какой её поставил автор шаблона, и снимать надо именно её.
+// namePlaceholderAfterComma and namePlaceholderBeforeComma match the
+// substitution together with the comma stuck to it. They are split into two
+// replacements because the comma sits on the side where the template author
+// put it, and exactly that one must be removed.
 var (
 	namePlaceholderAfterComma  = regexp.MustCompile(`(?i),[ \t]*\{\s*имя\s*\}`)
 	namePlaceholderBeforeComma = regexp.MustCompile(`(?i)\{\s*имя\s*\}[ \t]*,[ \t]*`)
 )
 
-// dropName убирает обращение из шаблона, когда имени нет.
+// dropName removes the address from the template when there is no name.
 func dropName(template string) string {
 	text := namePlaceholderAfterComma.ReplaceAllLiteralString(template, "")
 	text = namePlaceholderBeforeComma.ReplaceAllLiteralString(text, "")
@@ -690,24 +712,25 @@ func dropName(template string) string {
 	return strings.TrimSpace(text)
 }
 
-// hasName отвечает, зовёт ли шаблон имя получателя.
+// hasName reports whether the template uses the recipient name.
 func hasName(template string) bool {
 	return namePlaceholderPattern.MatchString(template)
 }
 
-// badBraces - места, где сервис не разобрал фигурную скобку. Проверяется каждая
-// скобка, а не только правильно спаренные: «{{имя}}» - обычная опечатка из
-// Jinja, и подстановка внутрь внешней пары дала бы человеку «Привет, {Пётр}!», а
-// незакрытое «{имя!» уехало бы в письмо литералом. После разбора известных
-// подстановок скобок в шаблоне остаться не должно ни одной.
-// Возвращает первые maxSpots мест и общее их число: отказ, показавший три места
-// из пяти, читается как полный список, и человек правит три, получает отказ
-// снова и принимает его за новый дефект.
+// badBraces returns the spots where the service did not parse a curly brace.
+// Every brace is checked, not only properly paired ones: "{{имя}}" is a common
+// Jinja typo, and substitution inside the outer pair would give the person
+// "Привет, {Пётр}!", while an unclosed "{имя!" would go into the message
+// literally. After the known substitutions are parsed, no braces may remain in
+// the template.
+// It returns the first maxSpots spots and their total count: a refusal that
+// showed three spots out of five reads as a full list, and the person fixes
+// three, gets the refusal again and takes it for a new defect.
 func badBraces(template string) (spots []string, total int) {
 	known := namePlaceholderPattern.FindAllStringIndex(template, -1)
 	runes := []rune(template)
-	// shown - докуда шаблон уже показан: соседние скобки одной опечатки («{{»)
-	// дают одно место в списке, а не два перекрывающихся.
+	// shown is how far the template has already been shown: adjacent braces of
+	// one typo ("{{") give one spot in the list, not two overlapping ones.
 	shown, pos := 0, -1
 	for at, symbol := range template {
 		pos++
@@ -723,11 +746,11 @@ func badBraces(template string) (spots []string, total int) {
 	return spots, total
 }
 
-// maxSpots - сколько мест показывает отказ: список длиннее человек всё равно
-// правит по одному, а ответ инструмента он вытесняет.
+// maxSpots is how many spots a refusal shows: a person fixes a longer list one
+// by one anyway, and it would crowd out the tool reply.
 const maxSpots = 3
 
-// covered - попала ли скобка внутрь распознанной подстановки.
+// covered reports whether the brace falls inside a recognised substitution.
 func covered(known [][]int, at int) bool {
 	for _, span := range known {
 		if at >= span[0] && at < span[1] {
@@ -737,39 +760,42 @@ func covered(known [][]int, at int) bool {
 	return false
 }
 
-// nameFault - чем имя негодно для этого шаблона: пусто, со скобкой или даёт
-// письмо длиннее предела. Пустая строка - имя годится. Один ответ на импорт и на
-// очередь: рубеж обязан говорить одинаково в обоих местах, а порядок причин -
-// определять, что увидит человек в отчёте.
+// nameFault returns why the name is unfit for this template: a brace in it, or
+// a message longer than the limit. An empty string means the name is fine. One
+// answer for import and for the queue: the guard must speak the same way in both
+// places, and the order of reasons determines what the person sees in the
+// report.
 //
-// Скобка в имени проверяется только там, где шаблон имя подставляет: без {имя}
-// оно в письмо не входит ни одним символом, и отсеивать человека не за что.
-// Пустое имя неисправностью не считается: решение владельца 02.09.2026 -
-// человек без годного имени остаётся в списке, и письмо уходит без обращения.
-// Подстановку убирает RenderMessage.
+// A brace in the name is checked only where the template substitutes the name:
+// without {имя} it does not enter the message by a single character, and there
+// is nothing to filter the person for. An empty name is not a fault: the owner
+// decided on 02.09.2026 that a person without a usable name stays in the list
+// and the message goes out without the address. RenderMessage removes the
+// substitution.
 func nameFault(template, name string) string {
 	if hasName(template) {
 		switch {
-		// Имя приходит из CRM и идёт в текст как есть: разметку сервис не режет
-		// намеренно, но фигурная скобка в имени - тот же симптом, против которого
-		// стоит проверка шаблона, вплоть до имени «{имя}».
+		// The name comes from the CRM and goes into the text as is: the service
+		// deliberately does not strip markup, but a curly brace in the name is the
+		// same symptom the template check stands against, up to a name "{имя}".
 		case strings.ContainsAny(name, "{}"):
 			return ReasonNameBraces
 		}
 	}
-	// Запас на имя в load_campaign - грубая оценка на входе, а настоящее имя
-	// известно здесь: длинное имя даёт письмо длиннее предела, и Telegram отверг
-	// бы его на отправке, когда список уже собран.
+	// The name allowance in load_campaign is a rough estimate at input, while the
+	// real name is known here: a long name makes the message exceed the limit, and
+	// Telegram would reject it at send time, when the list is already assembled.
 	if telegramLen(RenderMessage(template, name)) > maxTextLen {
 		return ReasonTextTooLong
 	}
 	return ""
 }
 
-// telegramLen - длина сообщения так, как её меряет Telegram: в единицах UTF-16,
-// где символ вне BMP (эмодзи, редкие иероглифы) идёт за два. Счёт рунами
-// занижает длину, и письмо с сотней эмодзи проходило проверку, а на отправке
-// получало MESSAGE_TOO_LONG, когда список уже собран.
+// telegramLen returns the message length the way Telegram measures it: in UTF-16
+// units, where a symbol outside the BMP (emoji, rare ideographs) counts as two.
+// Counting runes understates the length, and a message with a hundred emoji
+// passed the check and then got MESSAGE_TOO_LONG at send time, when the list was
+// already assembled.
 func telegramLen(text string) int {
 	length := 0
 	for _, symbol := range text {
@@ -781,30 +807,31 @@ func telegramLen(text string) int {
 	return length
 }
 
-// renderedLen - длина того, что реально уйдёт человеку, и заложенный в неё
-// запас на имена: по nameBudget на каждую подстановку, ноль - если подстановок
-// нет. Настоящее имя известно только в очереди, а отказывать надо на входе,
-// поэтому запас возвращается наружу - текст отказа не имеет права называть
-// запас, которого не считали.
+// renderedLen returns the length of what will actually go to the person and the
+// allowance for names built into it: nameBudget per substitution, zero if there
+// are no substitutions. The real name is known only in the queue, while the
+// refusal must happen at input, so the allowance is returned outward - the
+// refusal text must not name an allowance that was not counted.
 func renderedLen(template string) (used, budget int) {
 	used = telegramLen(RenderMessage(template, strings.Repeat("и", nameBudget)))
 	return used, nameBudget * len(namePlaceholderPattern.FindAllStringIndex(template, -1))
 }
 
-// cleanName приводит имя из CRM к виду, пригодному для письма: переносы строк и
-// повторяющиеся пробелы схлопываются, «Иван\n\nПетров» в тексте письма выглядит
-// как сбой. Разметка не режется и не экранируется намеренно: отправка идёт
-// plain-текстом, и <b> в имени - визуальный шум, а не инъекция. Пустая строка -
-// отсев.
+// cleanName brings a CRM name to a form fit for a message: line breaks and
+// repeated spaces collapse, "Иван\n\nПетров" in a message body looks like a
+// glitch. Markup is deliberately neither stripped nor escaped: sending is plain
+// text, and <b> in a name is visual noise, not an injection. An empty string
+// means filtering out.
 func cleanName(raw string) string {
 	return strings.Join(strings.Fields(raw), " ")
 }
 
-// normalizeUsername приводит ник к виду, в котором он лежит в БД: без пробелов,
-// "@" и обёртки t.me, в нижнем регистре. Форму ника проверяет telegram.IsUsername:
-// кириллица, телефон и огрызок вроде "ivan" сюда не проходят - лид без
-// пригодного ника в рассылку не попадает, догадываться по имени запрещено.
-// Пустая строка - отсев.
+// normalizeUsername brings a username to the form stored in the database:
+// without spaces, "@" and the t.me wrapper, lowercase. The username shape is
+// checked by telegram.IsUsername: Cyrillic, a phone number and a stub like
+// "ivan" do not pass - a lead without a usable username does not enter the
+// mailing, guessing from the name is forbidden. An empty string means
+// filtering out.
 func normalizeUsername(raw string) string {
 	name := strings.ToLower(strings.TrimSpace(raw))
 	if index := strings.LastIndex(name, "t.me/"); index >= 0 {
@@ -818,9 +845,9 @@ func normalizeUsername(raw string) string {
 	return name
 }
 
-// newRandomID выдаёт random_id строки: Telegram дедуплицирует по нему, поэтому
-// он генерируется один раз при вставке и переживает любой повтор доставки.
-// Ноль исключён - Telegram трактует его как «без дедупликации».
+// newRandomID returns the random_id of a row: Telegram deduplicates by it, so it
+// is generated once at insert and survives any delivery retry. Zero is excluded
+// - Telegram treats it as "no deduplication".
 func newRandomID() int64 {
 	return rand.Int64N(math.MaxInt64-1) + 1
 }

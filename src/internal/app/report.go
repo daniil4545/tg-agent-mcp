@@ -10,61 +10,63 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// StatusReport - снимок состояния сервиса: единственный инструмент чтения
-// отдаёт его целиком. Отдельных инструментов превью и построчного отчёта нет,
-// поэтому здесь собрано всё, чем владелец проверяет ход кампании.
+// StatusReport is a snapshot of the service state: the only read tool returns
+// it whole. There are no separate preview or per-row report tools, so
+// everything the owner uses to check campaign progress is collected here.
 type StatusReport struct {
-	// Campaign - nil, если кампаний нет вовсе.
+	// Campaign is nil when there are no campaigns at all.
 	Campaign *CampaignSummary
 	Accounts []AccountSummary
-	// Owners - служебные адресаты, для которых сняты окно, потолок и правило
-	// «одно сообщение». Отчёт называет их поимённо и всегда, а не только когда
-	// им сегодня писали: снятый рубеж, о котором никто не узнал, равен его
-	// отсутствию, а ошибка в DEV_ALLOW_LIST иначе видна только по ушедшему
-	// сообщению.
+	// Owners are the service recipients exempt from the send window, the daily
+	// cap and the "one message per person" rule. The report always names them,
+	// not only when they were written to today: a lifted guard nobody knows
+	// about is the same as no guard, and a mistake in DEV_ALLOW_LIST would
+	// otherwise show only as a message that already went out.
 	Owners []string
-	// Preview - до трёх сообщений на реальных строках кампании: владелец видит
-	// не шаблон, а то, что уйдёт человеку. Кампания на одного получателя не
-	// падает - превью просто короче.
+	// Preview holds up to three messages rendered on real campaign rows: the
+	// owner sees not the template but what a person will receive. A campaign
+	// with a single recipient does not fail, the preview is just shorter.
 	Preview []MessagePreview
-	// Rows заполняется только при full: построчный итог кампании.
+	// Rows is filled only when full is set: the per-row campaign result.
 	Rows []RecipientRow
-	// Idle - почему очередь стоит на момент вызова. Кампания при этом остаётся
-	// active, строки - в очереди, и без этой причины простой по окну, потолку или
-	// сломанному шаблону виден только косвенно, по счётчикам.
+	// Idle is why the queue stands still at the moment of the call. The campaign
+	// stays active and the rows stay queued, and without this reason an idle
+	// caused by the window, the cap or a broken template is visible only
+	// indirectly, through the counters.
 	Idle Idle
-	// Draft - подготовленный черновик, если он существует рядом с показанной
-	// кампанией. Иначе владелец сверял бы список по чужой кампании.
+	// Draft is the prepared draft, if one exists next to the shown campaign.
+	// Otherwise the owner would check the list against the wrong campaign.
 	Draft *CampaignNote
-	// Paused - кампания на паузе рядом с показанной: её продолжит start.
+	// Paused is a campaign on pause next to the shown one: start resumes it.
 	Paused *CampaignNote
-	// Held - строки, закреплённые за чужими аккаунтами: их не возьмёт никто,
-	// кроме названного отправщика. Без этого счётчика такие строки висят
-	// planned без причины и кампания не закрывается молча.
+	// Held holds rows pinned to other accounts: nobody but the named sender
+	// takes them. Without this counter such rows hang in planned with no
+	// visible reason and the campaign silently fails to close.
 	Held []HeldRows
-	// StuckDirect - ручные касания, зависшие в pending дольше протухания
-	// claim. Худший исход диалоговых инструментов: такая строка закрывает
-	// человека навсегда, а доставка неизвестна, и чинится она только руками.
+	// StuckDirect counts manual touches stuck in pending longer than the claim
+	// expiry. This is the worst outcome of the dialog tools: such a row closes
+	// the person for good while delivery is unknown, and only a human can fix it.
 	StuckDirect int
-	// StuckClaims - строки очереди с протухшим claim: отправщик их взял и не
-	// закрыл. Пока кампания активна, такую строку чистит очередь; у кампании на
-	// паузе этого не происходит, и человек молча закрыт для ручной отправки.
+	// StuckClaims counts queue rows with an expired claim: a sender took them
+	// and never closed them. While the campaign is active the queue clears such
+	// a row; on a paused campaign that does not happen, and the person is
+	// silently closed to manual sending.
 	StuckClaims int
 }
 
-// CampaignNote - соседняя кампания в отчёте: сколько в ней строк.
+// CampaignNote is a neighbouring campaign in the report: how many rows it has.
 type CampaignNote struct {
 	ID   int64
 	Rows int
 }
 
-// HeldRows - сколько строк ждут отправщика с этой меткой аккаунта.
+// HeldRows is how many rows wait for the sender with this account label.
 type HeldRows struct {
 	Label string
 	Rows  int
 }
 
-// CampaignSummary - кампания и счётчики её строк по состояниям.
+// CampaignSummary is a campaign and the counters of its rows by state.
 type CampaignSummary struct {
 	ID     int64
 	Title  string
@@ -73,46 +75,49 @@ type CampaignSummary struct {
 	States map[string]int
 }
 
-// AccountSummary - аккаунт с дневным расходом и активным стопом. Стоп виден в
-// каждом ответе status: рубеж, о котором никто не узнал, равен его отсутствию.
+// AccountSummary is an account with its daily usage and active stop. The stop
+// is visible in every status reply: a guard nobody knows about is the same as
+// no guard.
 type AccountSummary struct {
 	Label string
-	// UsedToday - весь дневной расход аккаунта тем же счётом, каким его считает
-	// рубеж: usedTodaySQL, один текст на отчёт и на ClaimNext. Кампанийные
-	// отправки, строки в работе и холодные касания руками уже сложены здесь.
+	// UsedToday is the account's whole daily usage, counted the way the guard
+	// counts it: usedTodaySQL, one text for the report and for ClaimNext.
+	// Campaign sends, rows in progress and manual cold touches are already
+	// summed here.
 	UsedToday int
-	// DailyLimit - потолок из БД. ACCOUNT_DAILY_LIMIT задаёт его только при
-	// создании строки аккаунта, поэтому отчёт показывает действующее число, а не
-	// переменную окружения.
+	// DailyLimit is the cap from the database. ACCOUNT_DAILY_LIMIT sets it only
+	// when the account row is created, so the report shows the effective number,
+	// not the environment variable.
 	DailyLimit int
 	Stopped    bool
 	StopReason string
-	// ColdToday - разбивка UsedToday: сколько в нём первых касаний незнакомцев
-	// руками. Человеку нужно видеть, чем израсходован потолок, а не только
-	// сколько его осталось.
+	// ColdToday is a breakdown of UsedToday: how much of it is manual first
+	// touches to strangers. A person needs to see what the cap was spent on, not
+	// only how much is left.
 	ColdToday int
-	// WarmToday - реплики в идущих диалогах за сегодня: в потолок не входят.
+	// WarmToday counts replies in ongoing dialogs today: they are outside the cap.
 	WarmToday int
-	// OwnerToday - сколько сообщений ушло сегодня служебным адресатам владельца,
-	// кампанией и руками вместе. В потолок не входят, и без этой строки расход
-	// на проверках рассылки не виден вовсе. Счёт тот же, каким считается сам
-	// потолок: касание с неизвестной доставкой входит сюда так же, как
-	// подтверждённое, иначе одно и то же сообщение считалось бы по-разному в
-	// соседних строках отчёта.
+	// OwnerToday is how many messages went today to the owner's service
+	// recipients, by campaign and by hand together. They are outside the cap, and
+	// without this line the usage on mailing checks is not visible at all. It is
+	// counted the way the cap itself is counted: a touch with unknown delivery
+	// counts here just like a confirmed one, otherwise the same message would be
+	// counted differently in neighbouring report lines.
 	OwnerToday int
-	// Idle - почему молчит этот аккаунт. Считается по каждому, а не только по
-	// метке процесса с MCP: рассылку ведут несколько отправщиков, и молчание
-	// одного из них - самый вероятный случай, который иначе не виден снаружи.
+	// Idle is why this account is silent. It is computed for every account, not
+	// only for the label of the MCP process: several senders run a campaign, and
+	// the silence of one of them is the most likely case, invisible from outside
+	// otherwise.
 	Idle Idle
 }
 
-// MessagePreview - готовый текст сообщения конкретному получателю.
+// MessagePreview is the ready message text for a specific recipient.
 type MessagePreview struct {
 	Username string
 	Text     string
 }
 
-// RecipientRow - строка построчного итога.
+// RecipientRow is one line of the per-row result.
 type RecipientRow struct {
 	Username string
 	Name     string
@@ -120,9 +125,9 @@ type RecipientRow struct {
 	Reason   string
 }
 
-// Status собирает снимок текущей кампании: активной, если она есть, иначе
-// черновика. full добавляет построчный итог; всё остальное отдаётся всегда -
-// счётчики, аккаунты со стопами и превью.
+// Status builds a snapshot of the current campaign: the active one if there is
+// one, otherwise the draft. full adds the per-row result; everything else is
+// always returned: counters, accounts with stops and the preview.
 func (s *Service) Status(ctx context.Context, full bool) (StatusReport, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx, currentCampaignSQL).Scan(&id)
@@ -148,9 +153,10 @@ func (s *Service) Status(ctx context.Context, full bool) (StatusReport, error) {
 	return s.StatusOf(ctx, id, full)
 }
 
-// StatusOf собирает снимок по названной кампании. Инструменты, которые только
-// что изменили конкретную кампанию, отчитываются именно по ней: при живой
-// активной кампании отчёт по «текущей» показал бы чужие счётчики и чужое превью.
+// StatusOf builds a snapshot of the named campaign. Tools that have just
+// changed a specific campaign report on exactly that one: with a live active
+// campaign, a report on the "current" one would show foreign counters and a
+// foreign preview.
 func (s *Service) StatusOf(ctx context.Context, campaignID int64, full bool) (StatusReport, error) {
 	var report StatusReport
 
@@ -202,8 +208,9 @@ func (s *Service) StatusOf(ctx context.Context, campaignID int64, full bool) (St
 		return StatusReport{}, fmt.Errorf("status: read states: %w", err)
 	}
 	report.Campaign = &summary
-	// Скобки показанной кампании, а не активной: строка отчёта говорит про «эту
-	// кампанию», и скобки чужого шаблона указали бы человеку не на тот текст.
+	// The braces of the shown campaign, not the active one: the report line is
+	// about "this campaign", and the braces of another template would point the
+	// person at the wrong text.
 	report.Idle.Braces, _ = badBraces(template)
 
 	preview, err := s.previewMessages(ctx, summary.ID, template)
@@ -235,9 +242,9 @@ func (s *Service) StatusOf(ctx context.Context, campaignID int64, full bool) (St
 	return report, nil
 }
 
-// sharedIdle - причины, одинаковые для всех аккаунтов: окно отправки, наличие
-// кампании и её шаблон общие, и повторять их в строке каждого аккаунта значит
-// спрятать среди них ту единственную причину, которая отличается.
+// sharedIdle reports reasons that are the same for all accounts: the send
+// window, the presence of a campaign and its template are shared, and repeating
+// them in every account line would bury the one reason that differs.
 func sharedIdle(reason string) bool {
 	switch reason {
 	case IdleWindowClosed, IdleNoCampaign, IdleBrokenTemplate, IdleQueueEmpty:
@@ -246,11 +253,11 @@ func sharedIdle(reason string) bool {
 	return false
 }
 
-// commonIdle - причина простоя, которую отчёт называет одной строкой на всю
-// очередь. Аккаунт один - это его причина, как и было до нескольких
-// отправщиков. Аккаунтов несколько - только общая причина и только когда она
-// совпала у всех: у расхода потолка и у стопа числа свои у каждого аккаунта, и
-// одна строка сверху обещала бы чужой запас.
+// commonIdle is the idle reason the report names in one line for the whole
+// queue. With one account it is that account's reason, as before several
+// senders existed. With several accounts it is only a shared reason, and only
+// when it matches for all: cap usage and stop numbers are per account, and one
+// line on top would promise someone else's headroom.
 func commonIdle(accounts []AccountSummary) Idle {
 	if len(accounts) == 0 {
 		return Idle{}
@@ -270,9 +277,9 @@ func commonIdle(accounts []AccountSummary) Idle {
 	return first
 }
 
-// campaignNote отдаёт соседнюю кампанию в названном состоянии, если она есть:
-// отчёт по идущей кампании обязан назвать отдельной строкой и подготовленный
-// черновик, и оставленную паузу, иначе про них забудут.
+// campaignNote returns the neighbouring campaign in the named status, if there
+// is one: a report on a running campaign must name the prepared draft and the
+// left-over pause on a separate line, otherwise they get forgotten.
 func (s *Service) campaignNote(ctx context.Context, status string) (*CampaignNote, error) {
 	var note CampaignNote
 	err := s.pool.QueryRow(ctx,
@@ -288,10 +295,10 @@ func (s *Service) campaignNote(ctx context.Context, status string) (*CampaignNot
 	return &note, nil
 }
 
-// heldRows считает строки очереди, закреплённые за другими аккаунтами. Строка
-// навсегда принадлежит взявшему её аккаунту, поэтому мёртвый или чужой
-// отправщик держит её planned, а кампания не закрывается. Оператор должен
-// видеть, отправщика с какой меткой ждёт очередь.
+// heldRows counts queue rows pinned to other accounts. A row belongs for good
+// to the account that took it, so a dead or foreign sender keeps it planned and
+// the campaign does not close. The operator must see which sender label the
+// queue is waiting for.
 func (s *Service) heldRows(ctx context.Context, campaignID int64) ([]HeldRows, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT a.label, count(*) FROM recipients r
@@ -318,13 +325,13 @@ func (s *Service) heldRows(ctx context.Context, campaignID int64) ([]HeldRows, e
 	return list, nil
 }
 
-// currentCampaignSQL выбирает кампанию, о которой спрашивают: активная важнее
-// черновика, черновик - приостановленной, и только потом идут закрытые по
-// свежести. Среди закрытых свежесть считает finished_at, а не id: done и
-// cancelled закрываются в любом порядке относительно создания, и id младшей
-// кампании ничего не говорит о том, кто закрылся позже. NULLS LAST и id DESC
-// остаются подстраховкой на случай пустого finished_at. Id инструменты не
-// передают, поэтому порядок задан здесь, а не догадкой вызывающего.
+// currentCampaignSQL selects the campaign being asked about: active beats
+// draft, draft beats paused, and only then come the closed ones by recency.
+// Among the closed ones recency is finished_at, not id: done and cancelled
+// close in any order relative to creation, and the id of the younger campaign
+// says nothing about which one closed later. NULLS LAST and id DESC remain as
+// a safety net for an empty finished_at. Tools do not pass an id, so the order
+// is fixed here instead of being guessed by the caller.
 const currentCampaignSQL = `SELECT id FROM campaigns
 	ORDER BY CASE status
 		WHEN 'active' THEN 0
@@ -334,11 +341,11 @@ const currentCampaignSQL = `SELECT id FROM campaigns
 	END, finished_at DESC NULLS LAST, id DESC
 	LIMIT 1`
 
-// accountsReportSQL - строка аккаунта в отчёте: расход тем же счётом, что и в
-// рубеже потолка (иначе status показывал бы запас там, где ClaimNext уже
-// отказывает), и его разбивка. Служебные адресаты идут отдельным числом и не
-// попадают ни в расход, ни в тёплые реплики: одно сообщение не имеет права быть
-// посчитанным дважды. $1 - начало суток, $2 - граница протухания claim.
+// accountsReportSQL builds the account row of the report: usage counted the way
+// the cap guard counts it (otherwise status would show headroom where ClaimNext
+// already refuses) and its breakdown. Service recipients are a separate number
+// and fall into neither usage nor warm replies: one message must not be
+// counted twice. $1 is the start of the day, $2 is the claim expiry boundary.
 func accountsReportSQL(owners string) string {
 	return `SELECT a.label, a.daily_limit, a.stopped, a.stop_reason,
 		` + usedTodaySQL(`a.id`, owners) + `,
@@ -374,11 +381,12 @@ func (s *Service) accountSummaries(ctx context.Context) ([]AccountSummary, error
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("status: read accounts: %w", err)
 	}
-	// Причина простоя считается по каждому аккаунту, а не по метке процесса с
-	// MCP: аккаунтов несколько, и вопрос «почему второй молчит» иначе не имеет
-	// ответа снаружи. Расчёт идёт тем же IdleReason, что пишет причину в лог у
-	// самого отправщика: второй расчёт рядом разъехался бы с первым.
-	// Сбой по одному аккаунту не уносит отчёт: строка останется без причины.
+	// The idle reason is computed per account, not by the label of the MCP
+	// process: there are several accounts, and the question "why is the second
+	// one silent" otherwise has no answer from outside. It uses the same
+	// IdleReason that writes the reason to the sender's own log: a second
+	// calculation next to it would drift from the first. A failure for one
+	// account does not sink the report: that line stays without a reason.
 	for i := range list {
 		idle, err := s.IdleReason(ctx, list[i].Label)
 		if err != nil {
@@ -390,10 +398,10 @@ func (s *Service) accountSummaries(ctx context.Context) ([]AccountSummary, error
 	return list, nil
 }
 
-// stuckDirect считает ручные касания, зависшие в pending дольше протухания
-// claim. У строки очереди протухший claim даёт второй шанс, у журнала такого
-// пути нет: pending закрывает человека навсегда, поэтому счётчик стоит в
-// каждом ответе status.
+// stuckDirect counts manual touches stuck in pending longer than the claim
+// expiry. For a queue row an expired claim gives a second chance; the journal
+// has no such path: pending closes the person for good, so the counter is in
+// every status reply.
 func (s *Service) stuckDirect(ctx context.Context) (int, error) {
 	var count int
 	if err := s.pool.QueryRow(ctx,
@@ -404,10 +412,10 @@ func (s *Service) stuckDirect(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-// stuckClaims считает строки очереди, которые отправщик взял и не закрыл.
-// Активная кампания разбирает их сама следующим витком, а кампания на паузе -
-// нет: такая строка держит человека закрытым и для ручной отправки, поэтому
-// счётчик стоит в каждом ответе status.
+// stuckClaims counts queue rows that a sender took and never closed. An active
+// campaign sorts them out itself on the next loop pass, a paused one does not:
+// such a row keeps the person closed to manual sending too, so the counter is
+// in every status reply.
 func (s *Service) stuckClaims(ctx context.Context) (int, error) {
 	var count int
 	if err := s.pool.QueryRow(ctx,
@@ -419,9 +427,9 @@ func (s *Service) stuckClaims(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-// LogStuckDirect называет зависшие касания при старте процесса. Ошибка чтения
-// сама по себе процесс не останавливает: это наблюдаемость, а не рубеж, - но
-// молчать о ней нельзя, иначе непрочитанный журнал выглядит как пустой.
+// LogStuckDirect names the stuck touches at process start. A read error does
+// not stop the process by itself: this is observability, not a guard, but it
+// must not stay silent, otherwise an unread journal looks like an empty one.
 func (s *Service) LogStuckDirect(ctx context.Context) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, username, created_at FROM direct_messages

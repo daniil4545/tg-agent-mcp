@@ -12,8 +12,8 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/telegram"
 )
 
-// senderOn собирает отправщика на тестовом сервисе: паузы почти нулевые, чтобы
-// цикл гонялся быстро, порог FLOOD_WAIT - минута.
+// senderOn builds a sender on the test service: pauses are almost zero so the
+// loop runs fast, the FLOOD_WAIT threshold is one minute.
 func senderOn(service *Service, transport Transport) *Sender {
 	service.cfg.SendPauseMin = time.Millisecond
 	service.cfg.SendPauseMax = 2 * time.Millisecond
@@ -21,15 +21,15 @@ func senderOn(service *Service, transport Transport) *Sender {
 	return NewSender(service, transport)
 }
 
-// stubTransport - подменный транспорт с заданным отказом: живого Telegram в
-// срезе нет, отказы приходят из разбора ошибок шаблона.
+// stubTransport is a substitute transport with a set refusal: there is no live
+// Telegram in the slice, refusals come from the template's error parsing.
 type stubTransport struct {
 	fail func(username string) error
-	// peerID - id, который резолв отдаёт как ссылку на человека; 0 - ссылки нет,
-	// как в dry-run.
+	// peerID is the id that resolve returns as a person reference; 0 means no
+	// reference, as in dry-run.
 	peerID int64
-	// messageID - id, который отправка называет успехом; 0 повторяет дубль по
-	// random_id, где Telegram номера не даёт.
+	// messageID is the id that a send reports as success; 0 repeats the duplicate
+	// by random_id, where Telegram gives no number.
 	messageID int
 
 	mu   sync.Mutex
@@ -62,14 +62,14 @@ func (t *stubTransport) Sent() []Delivery {
 	return append([]Delivery(nil), t.sent...)
 }
 
-// floodWait - отказ Telegram «подождите столько-то».
+// floodWait is a Telegram refusal of the "wait so many seconds" kind.
 func floodWait(pause time.Duration) error {
 	return &telegram.Failure{Kind: telegram.KindFloodWait, RetryAt: time.Now().Add(pause)}
 }
 
-// Смерть между доставкой и записью: строка отправлена, но не финализирована.
-// Протухший claim возвращает её в очередь, повтор идёт с тем же random_id -
-// Telegram дедуплицирует, второго сообщения человек не получает.
+// Death between delivery and the write: the row is sent but not finalized.
+// The stale claim returns it to the queue, the retry goes with the same random_id -
+// Telegram deduplicates, and the person does not get a second message.
 func TestResendAfterCrashKeepsRandomID(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -80,34 +80,34 @@ func TestResendAfterCrashKeepsRandomID(t *testing.T) {
 
 	claimed, err := service.ClaimNext(ctx, "test")
 	if err != nil || claimed == nil {
-		t.Fatalf("взять строку: %v, %+v", err, claimed)
+		t.Fatalf("claim a row: %v, %+v", err, claimed)
 	}
 	peer, err := transport.Resolve(ctx, claimed.Username)
 	if err != nil {
-		t.Fatalf("резолв: %v", err)
+		t.Fatalf("resolve: %v", err)
 	}
 	if _, err := transport.Send(ctx, peer, claimed.Text, claimed.RandomID); err != nil {
-		t.Fatalf("отправка: %v", err)
+		t.Fatalf("send: %v", err)
 	}
 
-	// Процесс убит до финализации: claim протухает, следующий виток берёт ту же
-	// строку.
+	// The process was killed before finalization: the claim goes stale, the next
+	// iteration takes the same row.
 	service.Now = func() time.Time { return testNow.Add(10 * time.Minute) }
 	if err := sender.step(ctx); err != nil {
-		t.Fatalf("виток после перезапуска: %v", err)
+		t.Fatalf("iteration after restart: %v", err)
 	}
 
 	sent := transport.Sent()
 	if len(sent) != 2 || sent[0].RandomID != sent[1].RandomID {
-		t.Fatalf("повтор ушёл с другим random_id: %+v", sent)
+		t.Fatalf("retry went out with a different random_id: %+v", sent)
 	}
 	if state, _ := recipientState(t, service.pool, "ivan_petrov"); state != "sent" {
-		t.Fatalf("строка в состоянии %q, ожидалось sent", state)
+		t.Fatalf("row in state %q, expected sent", state)
 	}
 }
 
-// Временная ошибка: FLOOD_WAIT короче порога - переждать, строка остаётся
-// planned, попытка не расходуется, аккаунт не останавливается.
+// Transient error: FLOOD_WAIT shorter than the threshold - wait, the row stays
+// planned, the attempt is not spent, the account is not stopped.
 func TestFloodWaitKeepsRowPlanned(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -117,33 +117,33 @@ func TestFloodWaitKeepsRowPlanned(t *testing.T) {
 	startWith(t, service, person(1, "ivan_petrov"))
 
 	if err := sender.step(ctx); err != nil {
-		t.Fatalf("виток отправщика: %v", err)
+		t.Fatalf("sender iteration: %v", err)
 	}
 
 	state, reason := recipientState(t, service.pool, "ivan_petrov")
 	if state != "planned" || reason != telegram.KindFloodWait {
-		t.Fatalf("строка в состоянии %q с причиной %q", state, reason)
+		t.Fatalf("row in state %q with reason %q", state, reason)
 	}
 	if stopped, _, err := service.AccountStopped(ctx, "test"); err != nil || stopped {
-		t.Fatalf("короткий FLOOD_WAIT остановил аккаунт: %v, %v", stopped, err)
+		t.Fatalf("short FLOOD_WAIT stopped the account: %v, %v", stopped, err)
 	}
 	again, err := service.ClaimNext(ctx, "test")
 	if err != nil || again == nil {
-		t.Fatalf("строка не вернулась в очередь: %v, %+v", err, again)
+		t.Fatalf("row did not return to the queue: %v, %+v", err, again)
 	}
 }
 
-// PEER_FLOOD - ограничение уровня аккаунта, а не отказ по человеку: рассылка с
-// него прекращается целиком, а строка возвращается в очередь неизрасходованной.
+// PEER_FLOOD is an account-level restriction, not a refusal about a person:
+// sending from it stops entirely, and the row returns to the queue unspent.
 func TestPeerFloodStopsAccount(t *testing.T) {
 	outcome := classifyDelivery(&telegram.Failure{Kind: telegram.KindPeerFlood, Permanent: true}, time.Minute)
 	if !outcome.stop || outcome.result != ResultRetry {
-		t.Fatalf("PEER_FLOOD разобран как %+v", outcome)
+		t.Fatalf("PEER_FLOOD parsed as %+v", outcome)
 	}
 }
 
-// Постоянная ошибка по человеку: строка undelivered с причиной, кампания идёт
-// дальше и закрывается на пустой очереди.
+// Permanent error about a person: the row is undelivered with a reason, the
+// campaign goes on and closes on an empty queue.
 func TestPeerForbiddenMarksUndelivered(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -159,25 +159,25 @@ func TestPeerForbiddenMarksUndelivered(t *testing.T) {
 
 	for range 3 {
 		if err := sender.step(ctx); err != nil {
-			t.Fatalf("виток отправщика: %v", err)
+			t.Fatalf("sender iteration: %v", err)
 		}
 	}
 
 	state, reason := recipientState(t, service.pool, "closed_one")
 	if state != "undelivered" || reason != telegram.KindPeerForbidden {
-		t.Fatalf("закрытая личка дала состояние %q с причиной %q", state, reason)
+		t.Fatalf("closed private chat gave state %q with reason %q", state, reason)
 	}
 	if state, _ := recipientState(t, service.pool, "open_one"); state != "sent" {
-		t.Fatalf("кампания не продолжилась: второй получатель в состоянии %q", state)
+		t.Fatalf("campaign did not continue: second recipient in state %q", state)
 	}
 	if status := campaignStatus(t, service.pool, id); status != "done" {
-		t.Fatalf("кампания в состоянии %q", status)
+		t.Fatalf("campaign in state %q", status)
 	}
 }
 
-// Постоянная ошибка аккаунта: FLOOD_WAIT длиннее порога останавливает аккаунт в
-// БД, строка возвращается в planned, отправок с него больше нет, а стоп виден
-// снаружи - на нём стоит healthcheck.
+// Permanent account error: FLOOD_WAIT longer than the threshold stops the
+// account in the DB, the row returns to planned, no more sends from it, and the
+// stop is visible from outside - the healthcheck relies on it.
 func TestAccountStopOnLongFloodWait(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -187,31 +187,31 @@ func TestAccountStopOnLongFloodWait(t *testing.T) {
 	startWith(t, service, person(1, "ivan_petrov"))
 
 	if err := sender.step(ctx); err != nil {
-		t.Fatalf("виток отправщика: %v", err)
+		t.Fatalf("sender iteration: %v", err)
 	}
 
 	stopped, reason, err := service.AccountStopped(ctx, "test")
 	if err != nil || !stopped || reason != telegram.KindFloodWait {
-		t.Fatalf("аккаунт не остановлен: %v, %q, %v", stopped, reason, err)
+		t.Fatalf("account not stopped: %v, %q, %v", stopped, reason, err)
 	}
 	if state, _ := recipientState(t, service.pool, "ivan_petrov"); state != "planned" {
-		t.Fatalf("строка в состоянии %q, ожидалось planned", state)
+		t.Fatalf("row in state %q, expected planned", state)
 	}
 	if claimed, err := service.ClaimNext(ctx, "test"); err != nil || claimed != nil {
-		t.Fatalf("остановленный аккаунт взял строку: %+v, %v", claimed, err)
+		t.Fatalf("stopped account took a row: %+v, %v", claimed, err)
 	}
 
-	// Снятие - только командой человека.
+	// Lifting is only by a human command.
 	if _, _, err := service.ResumeAccount(ctx, "test"); err != nil {
-		t.Fatalf("снять стоп: %v", err)
+		t.Fatalf("lift the stop: %v", err)
 	}
 	if claimed, err := service.ClaimNext(ctx, "test"); err != nil || claimed == nil {
-		t.Fatalf("после снятия стопа строка не взялась: %+v, %v", claimed, err)
+		t.Fatalf("row was not taken after the stop was lifted: %+v, %v", claimed, err)
 	}
 }
 
-// Перезапуск посреди кампании: новый процесс продолжает с planned, никому не
-// шлёт второй раз и доводит кампанию до done; цикл уходит по отмене контекста.
+// Restart in the middle of a campaign: the new process continues from planned,
+// sends to nobody a second time and brings the campaign to done; the loop exits on context cancel.
 func TestRestartContinuesCampaign(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -219,7 +219,7 @@ func TestRestartContinuesCampaign(t *testing.T) {
 	first := &stubTransport{}
 	id := startWith(t, service, person(1, "first_one"), person(2, "second_one"))
 	if err := senderOn(service, first).step(ctx); err != nil {
-		t.Fatalf("виток до перезапуска: %v", err)
+		t.Fatalf("iteration before restart: %v", err)
 	}
 
 	second := &stubTransport{}
@@ -232,13 +232,13 @@ func TestRestartContinuesCampaign(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for campaignStatus(t, service.pool, id) != "done" {
 		if time.Now().After(deadline) {
-			t.Fatal("кампания не закрылась после перезапуска")
+			t.Fatal("campaign did not close after restart")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл вернул ошибку: %v", err)
+		t.Fatalf("loop returned an error: %v", err)
 	}
 
 	delivered := map[string]int{}
@@ -246,14 +246,14 @@ func TestRestartContinuesCampaign(t *testing.T) {
 		delivered[item.Username]++
 	}
 	if len(delivered) != 2 || delivered["first_one"] != 1 || delivered["second_one"] != 1 {
-		t.Fatalf("отправки после перезапуска: %+v", delivered)
+		t.Fatalf("sends after restart: %+v", delivered)
 	}
 }
 
-// Входящее личное сообщение закрывает строку человека, но по-разному:
-// отправленную переводит в replied, ещё не отправленную - в skipped с причиной
-// «написал сам». Приглашение не уходит ни в том, ни в другом случае, а в
-// метрику ответов попадает только тот, кому письмо действительно ушло.
+// An incoming private message closes the person's row, but differently: a sent
+// row moves to replied, a not yet sent one to skipped with the reason
+// "wrote first". The invitation goes out in neither case, and only the person
+// the message actually reached counts in the reply metric.
 func TestInboundEventMarksReplied(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -262,7 +262,7 @@ func TestInboundEventMarksReplied(t *testing.T) {
 	sender := senderOn(service, transport)
 	startWith(t, service, person(1, "answered_one"), person(2, "wrote_first"))
 	if err := sender.step(ctx); err != nil {
-		t.Fatalf("виток отправщика: %v", err)
+		t.Fatalf("sender iteration: %v", err)
 	}
 
 	want := map[string]struct{ state, reason string }{
@@ -270,27 +270,27 @@ func TestInboundEventMarksReplied(t *testing.T) {
 		"wrote_first":  {"skipped", ReasonWroteFirst},
 	}
 	for _, name := range []string{"answered_one", "wrote_first"} {
-		event := telegram.Message{Peer: telegram.NewRef(telegram.KindUser, 100), Username: name, Text: "привет"}
+		event := telegram.Message{Peer: telegram.NewRef(telegram.KindUser, 100), Username: name, Text: "hello"}
 		if err := sender.OnMessage(ctx, event); err != nil {
-			t.Fatalf("входящее от %s: %v", name, err)
+			t.Fatalf("incoming from %s: %v", name, err)
 		}
 		state, reason := recipientState(t, service.pool, name)
 		if state != want[name].state || reason != want[name].reason {
-			t.Fatalf("строка %s в состоянии %q (%s), ожидалось %q (%s)",
+			t.Fatalf("row %s in state %q (%s), expected %q (%s)",
 				name, state, reason, want[name].state, want[name].reason)
 		}
 	}
 
 	if err := sender.step(ctx); err != nil {
-		t.Fatalf("виток после ответов: %v", err)
+		t.Fatalf("iteration after replies: %v", err)
 	}
 	if sent := transport.Sent(); len(sent) != 1 || sent[0].Username != "answered_one" {
-		t.Fatalf("написавшему первым ушло приглашение: %+v", sent)
+		t.Fatalf("invitation went out to the one who wrote first: %+v", sent)
 	}
 }
 
-// Короткое входящее ника не несёт: человек узнаётся по id Telegram,
-// сохранённому при отправке.
+// A short incoming update carries no username: the person is recognized by the
+// Telegram id saved at send time.
 func TestReplyMatchedByUserID(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -298,21 +298,21 @@ func TestReplyMatchedByUserID(t *testing.T) {
 	sender := senderOn(service, &stubTransport{peerID: 777})
 	startWith(t, service, person(1, "ivan_petrov"))
 	if err := sender.step(ctx); err != nil {
-		t.Fatalf("виток отправщика: %v", err)
+		t.Fatalf("sender iteration: %v", err)
 	}
 
-	event := telegram.Message{Peer: telegram.NewRef(telegram.KindUser, 777), Text: "привет"}
+	event := telegram.Message{Peer: telegram.NewRef(telegram.KindUser, 777), Text: "hello"}
 	if err := sender.OnMessage(ctx, event); err != nil {
-		t.Fatalf("входящее без ника: %v", err)
+		t.Fatalf("incoming without username: %v", err)
 	}
 	if state, _ := recipientState(t, service.pool, "ivan_petrov"); state != "replied" {
-		t.Fatalf("строка в состоянии %q, ожидалось replied", state)
+		t.Fatalf("row in state %q, expected replied", state)
 	}
 }
 
-// Строку увели из очереди, пока шла отправка: доставка всё равно записывается,
-// а не теряется в ERROR-логе - без sent_at человек получил бы второе сообщение
-// в следующей кампании.
+// The row was taken out of the queue while the send was in flight: the delivery
+// is still recorded and not lost in the ERROR log - without sent_at the person
+// would get a second message in the next campaign.
 func TestDeliveredRowRecordedAfterSkip(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -321,28 +321,28 @@ func TestDeliveredRowRecordedAfterSkip(t *testing.T) {
 	startWith(t, service, person(1, "ivan_petrov"))
 	claimed, err := service.ClaimNext(ctx, "test")
 	if err != nil || claimed == nil {
-		t.Fatalf("взять строку: %v, %+v", err, claimed)
+		t.Fatalf("claim a row: %v, %+v", err, claimed)
 	}
 	if _, err := service.pool.Exec(ctx,
 		`UPDATE recipients SET state = 'skipped' WHERE id = $1`, claimed.ID); err != nil {
-		t.Fatalf("увести строку из очереди: %v", err)
+		t.Fatalf("take the row out of the queue: %v", err)
 	}
 
 	logged := captureLogs(t)
 	if err := sender.SendClaimed(ctx, claimed); err != nil {
-		t.Fatalf("отправка: %v", err)
+		t.Fatalf("send: %v", err)
 	}
 	if text := logged.String(); strings.Contains(text, "delivered message was not recorded") {
-		t.Fatalf("доставка не записана:\n%s", text)
+		t.Fatalf("delivery was not recorded:\n%s", text)
 	}
 	if state, _ := recipientState(t, service.pool, "ivan_petrov"); state != "sent" {
-		t.Fatalf("строка в состоянии %q, ожидалось sent", state)
+		t.Fatalf("row in state %q, expected sent", state)
 	}
 }
 
-// Строку закрыл второй процесс той же метки, перехвативший протухший claim:
-// доставка в БД уже записана, и ERROR здесь был бы ложной тревогой на рубеже
-// наблюдаемости - настоящий стоп потерялся бы среди таких записей.
+// The row was closed by a second process with the same label that took over a
+// stale claim: the delivery is already recorded in the DB, and ERROR here would
+// be a false alarm at the observability guard - a real stop would get lost among such records.
 func TestDeliveryRecordedByOtherProcessIsNotError(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -351,23 +351,23 @@ func TestDeliveryRecordedByOtherProcessIsNotError(t *testing.T) {
 	startWith(t, service, person(1, "ivan_petrov"))
 	claimed, err := service.ClaimNext(ctx, "test")
 	if err != nil || claimed == nil {
-		t.Fatalf("взять строку: %v, %+v", err, claimed)
+		t.Fatalf("claim a row: %v, %+v", err, claimed)
 	}
 	if _, err := service.FinishClaim(ctx, claimed, ResultSent, ""); err != nil {
-		t.Fatalf("запись доставки вторым процессом: %v", err)
+		t.Fatalf("recording the delivery by the second process: %v", err)
 	}
 
 	logged := captureLogs(t)
 	if err := sender.SendClaimed(ctx, claimed); err != nil {
-		t.Fatalf("отправка: %v", err)
+		t.Fatalf("send: %v", err)
 	}
 	if text := logged.String(); strings.Contains(text, "delivered message was not recorded") {
-		t.Fatalf("ложная тревога на записанной доставке:\n%s", text)
+		t.Fatalf("false alarm on a recorded delivery:\n%s", text)
 	}
 }
 
-// captureLogs перехватывает записи уровня WARN и выше на время теста: рубеж,
-// единственный след которого - лог, иначе проверить нечем.
+// captureLogs captures WARN and higher records for the duration of a test: a
+// guard whose only trace is the log cannot be checked otherwise.
 func captureLogs(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buffer bytes.Buffer

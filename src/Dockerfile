@@ -20,7 +20,7 @@ LABEL org.opencontainers.image.revision=$VCS_REF
 COPY --from=builder /out/tg-agent-mcp /app
 COPY --from=builder /out/goose /goose
 COPY --from=builder /src/migrations /migrations
-# Каталог сессии MTProto: права 0700 и владелец nonroot - в нём лежит доступ к
-# живому аккаунту. В dry-run контуре он остаётся пустым.
+# MTProto session directory: mode 0700 and owned by nonroot, because it holds
+# access to the live account. It stays empty in the dry-run stack.
 COPY --from=builder --chown=65532:65532 --chmod=0700 /out/service-data /var/lib/tg-agent-mcp
 CMD ["/app"]

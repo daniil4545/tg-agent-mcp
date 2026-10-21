@@ -8,30 +8,30 @@ import (
 	"github.com/gotd/td/tg"
 )
 
-// Kind - вид адресата. Тремя видами Telegram и ограничивается: человек,
-// обычная группа, супергруппа или канал.
+// Kind is the kind of recipient. Telegram is limited to three kinds: a person,
+// a regular group, a supergroup or channel.
 type Kind string
 
 const (
 	KindUser    Kind = "user"
-	KindChat    Kind = "chat"    // обычная группа
-	KindChannel Kind = "channel" // супергруппа или канал
+	KindChat    Kind = "chat"    // regular group
+	KindChannel Kind = "channel" // supergroup or channel
 )
 
-// Ref - ссылка на адресата в виде `user:123`, `chat:123`, `channel:123`.
+// Ref is a reference to a recipient in the form `user:123`, `chat:123`, `channel:123`.
 //
-// Строка, а не структура, потому что этот идентификатор живёт в БД, в ключах
-// очереди и в логах. Каноническая запись без ведущих нулей: иначе один адресат
-// получил бы два разных ключа очереди и два «первых» сообщения.
+// A string, not a struct, because this identifier lives in the DB, in queue
+// keys and in logs. The canonical form has no leading zeros: otherwise one
+// recipient would get two different queue keys and two "first" messages.
 type Ref string
 
-// NewRef собирает ссылку на адресата.
+// NewRef builds a reference to a recipient.
 func NewRef(kind Kind, id int64) Ref {
 	return Ref(string(kind) + ":" + strconv.FormatInt(id, 10))
 }
 
-// Split разбирает ссылку. Ошибка означает, что данные испорчены на стороне
-// сервиса, а не отказ Telegram.
+// Split parses a reference. An error means the data is corrupted on the
+// service side, not a Telegram refusal.
 func (r Ref) Split() (Kind, int64, error) {
 	kind, rawID, ok := strings.Cut(string(r), ":")
 	if !ok || rawID == "" {
@@ -49,8 +49,8 @@ func (r Ref) Split() (Kind, int64, error) {
 	return Kind(kind), id, nil
 }
 
-// UserID разбирает ссылку, которая обязана указывать на человека. Нужен там,
-// где групповой адресат - это ошибка данных, а не другой сценарий.
+// UserID parses a reference that must point to a person. It is needed where a
+// group recipient is a data error, not another scenario.
 func (r Ref) UserID() (int64, error) {
 	kind, id, err := r.Split()
 	if err != nil {
@@ -62,7 +62,7 @@ func (r Ref) UserID() (int64, error) {
 	return id, nil
 }
 
-// refFromPeer переводит адресата из апдейта в ссылку.
+// refFromPeer turns a recipient from an update into a reference.
 func refFromPeer(peer tg.PeerClass) (Ref, bool) {
 	switch value := peer.(type) {
 	case *tg.PeerUser:

@@ -9,16 +9,16 @@ endif
 GOOSE := go run github.com/pressly/goose/v3/cmd/goose@v3.27.1
 MIGRATIONS_DIR := ./migrations
 
-# База интеграционного яруса: по умолчанию тот же локальный Postgres из
-# docker-compose.yml, куда мигрирует migrate-up. Без дефолта весь ярус тихо
-# скипался, и ci-check оставался зелёным ни на чём.
+# Database for the integration tier: by default the same local Postgres from
+# docker-compose.yml that migrate-up migrates. Without a default the whole tier
+# was skipped silently and ci-check stayed green on nothing.
 TEST_DATABASE_URL ?= postgres://tg_agent_mcp:tg_agent_mcp@localhost:5433/tg_agent_mcp?sslmode=disable
 export TEST_DATABASE_URL
 
 LIVE := docker compose -f docker-compose.local.yml
 DUMP_DIR := ../backups
 
-# Отправщик на один аккаунт: тот же образ, свой проект на каждую метку.
+# One sender per account: the same image, one compose project per label.
 SENDER := docker compose -f docker-compose.sender.yml
 ACCOUNTS_DIR := accounts
 SENDER_PROJECT := tg-agent-mcp-acc-$(label)
@@ -33,23 +33,23 @@ run:
 build:
 	go build ./...
 
-# RUN фильтрует тесты при разборе: make test RUN=TestFoo. Пустой
-# TEST_DATABASE_URL - отказ, а не скип: тесты рубежей живут в базе, и зелёный
-# прогон без них ничего не значит.
+# RUN filters tests while debugging: make test RUN=TestFoo. An empty
+# TEST_DATABASE_URL is a refusal, not a skip: the guard tests live in the
+# database, and a green run without them proves nothing.
 test:
-	@test -n "$(TEST_DATABASE_URL)" || { echo "TEST_DATABASE_URL is empty: интеграционный ярус пропускать нельзя, поднимите базу (docker compose up -d) или задайте переменную"; exit 1; }
+	@test -n "$(TEST_DATABASE_URL)" || { echo "TEST_DATABASE_URL is empty: the integration tier must not be skipped, start the database (docker compose up -d) or set the variable"; exit 1; }
 	go test ./... $(if $(RUN),-run $(RUN) -count=1,)
 
-# Быстрый ярус для петли внутри среза: только то, что не ходит в БД. Срез и
-# релиз закрываются полным make test - test-fast его не заменяет.
+# Fast tier for the inner loop: only what does not touch the database. A slice
+# and a release are closed by a full make test; test-fast does not replace it.
 test-fast:
 	go test -short ./... $(if $(RUN),-run $(RUN) -count=1,)
 
 vet:
 	go vet ./...
 
-# Форматирование не ловит никто другой: gofmt нет ни в дефолтном наборе
-# golangci-lint, ни в хуке на правку файла - расхождение уезжало бы в релиз молча.
+# Nothing else catches formatting: gofmt is neither in the default golangci-lint
+# set nor in the edit hook, so a mismatch would reach a release silently.
 fmt-check:
 	@out=$$(gofmt -l ./cmd ./internal); \
 	test -z "$$out" || { echo "gofmt needed:"; echo "$$out"; exit 1; }
@@ -57,14 +57,15 @@ fmt-check:
 lint:
 	golangci-lint run --timeout 120s
 
-# Кольцо коммита: секунды, без БД. Полный набор закрывает срез (ci-check).
+# Commit ring: seconds, no database. The full set closes a slice (ci-check).
 commit-check: fmt-check vet lint test-fast
 
 ci-check: migrate-up test vet fmt-check lint build
 
-# Синтаксис стека Coolify проверяется до выката: опечатка в compose обнаружится
-# на хосте, где чинить её дороже всего. exclude_from_hc - расширение Coolify, и
-# docker compose его не знает, поэтому строка снимается на копии файла.
+# The Coolify stack syntax is checked before a rollout: a typo in compose would
+# otherwise surface on the host, where it is most expensive to fix.
+# exclude_from_hc is a Coolify extension unknown to docker compose, so the line
+# is stripped from a copy of the file.
 deploy-check:
 	@tmp=$$(mktemp ./docker-compose.coolify.XXXXXX.yml); \
 	trap 'rm -f "$$tmp"' EXIT; \
@@ -78,9 +79,9 @@ deploy-check:
 	trap 'rm -f $(ACCOUNTS_DIR)/synthcheck.env' EXIT; \
 	LABEL=synthcheck POSTGRES_PASSWORD=check $(SENDER) config --quiet
 
-# DATABASE_URL молча подхватывается из .env, поэтому migrate-* может уехать в
-# чужую базу. Печатаем цель (без userinfo) и требуем явный ALLOW_REMOTE=1 для
-# всего, что не localhost.
+# DATABASE_URL is picked up from .env silently, so migrate-* can end up in
+# someone else's database. Print the target (without userinfo) and require an
+# explicit ALLOW_REMOTE=1 for anything that is not localhost.
 check-db:
 	@test -n "$(DATABASE_URL)" || { echo "DATABASE_URL is not set"; exit 1; }
 	@rest=$$(printf '%s' "$(DATABASE_URL)" | sed -e 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||' -e 's|^.*@||'); \
@@ -102,16 +103,17 @@ check-db:
 		fi ;; \
 	esac
 
-# Команда не эхом: в ней целиком лежит DATABASE_URL с паролем, а цель миграции
-# уже напечатал check-db без userinfo.
+# The command is not echoed: it carries the whole DATABASE_URL with the
+# password, and check-db has already printed the migration target without
+# userinfo.
 migrate-up: check-db
 	@$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" up
 
 migrate-down: check-db
 	@$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" down
 
-# Боевой контур на этой машине: MCP рядом с Claude Code, отправка с домашнего
-# IP. Настройки - src/.env по образцу .env.example.
+# Live stack on this machine: MCP next to Claude Code, sending from a home IP.
+# Settings live in src/.env, modeled on .env.example.
 live-up:
 	$(LIVE) up -d --build
 	@echo "MCP: http://127.0.0.1:$${MCP_PORT:-8087}/mcp"
@@ -122,62 +124,65 @@ live-down:
 live-logs:
 	$(LIVE) logs -f app
 
-# Вход в аккаунт: Telegram присылает код, ввести его может только человек.
-# Работает на поднятом контуре в dry-run - там файл сессии никем не занят.
+# Account login: Telegram sends a code, and only a human can enter it.
+# Works on a running stack in dry-run, where nothing holds the session file.
 live-authorize:
 	$(LIVE) exec app /app authorize
 
-# Дамп базы кампаний. В ней лежит знание, кому уже писали, - единственный
-# рубеж «один человек - одно сообщение» между кампаниями. Снимать перед
-# каждой кампанией.
+# Dump of the campaign database. It holds the record of who was already
+# messaged, which is the only "one person, one message" guard across campaigns.
+# Take a dump before every campaign.
 live-dump:
 	@mkdir -p $(DUMP_DIR)
 	@$(LIVE) exec -T postgres pg_dump -U tg_agent_mcp tg_agent_mcp \
 		> $(DUMP_DIR)/campaigns-$$(date +%Y%m%d-%H%M).sql
 	@ls -lh $(DUMP_DIR) | tail -1
 
-# Дополнительные аккаунты: один отправщик на метку, своим проектом поверх сети и
-# базы основного контура. Все цели принимают label=<метка>, настройки аккаунта
-# лежат в accounts/<метка>.env (в гит не попадают).
+# Additional accounts: one sender per label, as its own project on top of the
+# main stack's network and database. All targets take label=<label>; account
+# settings live in accounts/<label>.env (not committed to git).
 accounts:
-	@echo "Файлы аккаунтов:"
+	@echo "Account files:"
 	@ls $(ACCOUNTS_DIR)/*.env 2>/dev/null | sed 's|.*/||; s|\.env$$||; s|^|  |' || true
-	@echo "Отправщики:"
+	@echo "Senders:"
 	@docker ps -a --filter name=tg-agent-mcp-acc- --format '  {{.Names}}\t{{.Status}}' || true
 
-# Рубеж метки: под одной меткой не должны работать два живых аккаунта - потолок
-# и стоп в БД считаются по метке, и второй аккаунт молча расходовал бы чужой
-# счёт. Ловится здесь, потому что файл аккаунта заводят копированием соседнего.
+# Label guard: two live accounts must not run under one label. The cap and the
+# stop flag in the database are counted per label, so a second account would
+# silently spend another account's budget. Caught here because an account file
+# is created by copying a neighbouring one.
 check-account:
-	@test -n "$(label)" || { echo "нужна метка: make $(MAKECMDGOALS) label=<метка>"; exit 1; }
+	@test -n "$(label)" || { echo "label required: make $(MAKECMDGOALS) label=<label>"; exit 1; }
 	@test -f $(ACCOUNTS_DIR)/$(label).env || \
-		{ echo "нет файла $(ACCOUNTS_DIR)/$(label).env, заведите его по $(ACCOUNTS_DIR)/account.env.example"; exit 1; }
+		{ echo "no file $(ACCOUNTS_DIR)/$(label).env, create it from $(ACCOUNTS_DIR)/account.env.example"; exit 1; }
 	@file_label=$$(sed -n 's/^ACCOUNT_LABEL=//p' $(ACCOUNTS_DIR)/$(label).env | tail -1 | tr -d '"'\''' | tr -d '[:space:]'); \
 	test "$$file_label" = "$(label)" || \
-		{ echo "в $(ACCOUNTS_DIR)/$(label).env стоит ACCOUNT_LABEL=$$file_label, а метка команды $(label)"; exit 1; }; \
+		{ echo "$(ACCOUNTS_DIR)/$(label).env sets ACCOUNT_LABEL=$$file_label, but the command label is $(label)"; exit 1; }; \
 	test "$$file_label" != "$(ACCOUNT_LABEL)" || \
-		{ echo "метка $$file_label уже занята основным контуром: аккаунту нужна своя"; exit 1; }
+		{ echo "label $$file_label is already taken by the main stack: the account needs its own"; exit 1; }
 
-# Поднимается в dry-run: сразу после подъёма в аккаунт ещё не вошли, и файл
-# сессии пуст. Режим задаёт цель, а не файл аккаунта: своё имя переменной
-# нужно потому, что общий TRANSPORT из src/.env стоит живым режимом.
+# Starts in dry-run: right after startup nobody has logged in to the account
+# yet and the session file is empty. The target sets the mode, not the account
+# file: a dedicated variable name is needed because the shared TRANSPORT from
+# src/.env is set to live.
 account-up: check-account
 	LABEL=$(label) SENDER_TRANSPORT=dry-run $(SENDER) -p $(SENDER_PROJECT) up -d --build
-	@echo "отправщик $(label) поднят в dry-run; вход в аккаунт - make account-authorize label=$(label)"
+	@echo "sender $(label) started in dry-run; log in to the account with: make account-authorize label=$(label)"
 
-# Вход в аккаунт: Telegram присылает код, ввести его может только человек.
+# Account login: Telegram sends a code, and only a human can enter it.
 account-authorize: check-account
 	LABEL=$(label) $(SENDER) -p $(SENDER_PROJECT) exec app /app authorize
 
-# Живой режим: контейнер пересоздаётся с TRANSPORT=live на той же сессии.
-# --build обязателен: без него up пересоздаёт контейнер на прежнем образе, и
-# отправщик молча остаётся на старом коде (поймано на выкате v0.9.0 23.09.2026).
+# Live mode: the container is recreated with TRANSPORT=live on the same session.
+# --build is required: without it up recreates the container on the old image
+# and the sender silently stays on old code (caught on the v0.9.0 rollout,
+# 2026-09-23).
 account-live: check-account
 	LABEL=$(label) SENDER_TRANSPORT=live $(SENDER) -p $(SENDER_PROJECT) up -d --build
-	@echo "отправщик $(label) переведён в live; расход и причину простоя покажет status"
+	@echo "sender $(label) switched to live; status shows spend and the reason for any idle time"
 
-# Останавливает только этот отправщик. Том с сессией остаётся: он стирается
-# отдельно и только при замене аккаунта (docs/runbook-account.md).
+# Stops only this sender. The session volume stays: it is erased separately
+# and only when the account is replaced (docs/runbook-account.md).
 account-down: check-account
 	LABEL=$(label) $(SENDER) -p $(SENDER_PROJECT) down
 

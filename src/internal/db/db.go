@@ -1,7 +1,7 @@
-// Package db - открытие пула PostgreSQL и транзакция.
+// Package db opens a PostgreSQL pool and runs transactions.
 //
-// Всё остальное в слое БД у сервисов своё: запросы и разбор строк идут вместе с
-// доменом, и общего в них нет ничего, кроме этих двух функций.
+// Everything else in the database layer belongs to each service: queries and
+// row parsing live with the domain, and only these two functions are shared.
 package db
 
 import (
@@ -13,14 +13,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Open открывает пул и сразу проверяет связь. Пинг на старте обязателен: без
-// него сервис поднимается «здоровым» и падает на первом же запросе, когда
-// разбираться уже некогда.
+// Open opens a pool and checks the connection right away. The ping at startup
+// is mandatory: without it the service comes up "healthy" and fails on the
+// first query, when there is no time left to investigate.
 //
-// maxConns берётся не с потолка: он обязан покрывать все горутины, которые
-// одновременно держат соединение - воркеры очереди, фоновые опросы, обработчики
-// входящих. Меньше - и работы встанут в очередь за соединением, а выглядеть это
-// будет как медленный внешний сервис.
+// maxConns is not arbitrary: it must cover all goroutines that hold a
+// connection at the same time - queue workers, background polls, handlers of
+// incoming events. With less, work queues up behind the connection and looks
+// like a slow external service.
 func Open(ctx context.Context, url string, maxConns int32) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
@@ -44,8 +44,8 @@ func Open(ctx context.Context, url string, maxConns int32) (*pgxpool.Pool, error
 	return pool, nil
 }
 
-// InTx выполняет fn в транзакции. Откат отложен и срабатывает на любом выходе,
-// включая панику; после успешного Commit он уже безвреден.
+// InTx runs fn in a transaction. The rollback is deferred and fires on any
+// exit, including a panic; after a successful Commit it is harmless.
 func InTx(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {

@@ -7,25 +7,25 @@ import (
 	"time"
 )
 
-// Пустая база - штатное состояние сервиса до первой кампании: status обязан
-// ответить, а не упасть на отсутствующей кампании.
+// An empty database is the normal state before the first campaign: status must
+// answer instead of failing on a missing campaign.
 func TestStatusWithoutCampaign(t *testing.T) {
 	service := newService(t)
 
 	report, err := service.Status(context.Background(), true)
 	if err != nil {
-		t.Fatalf("статус: %v", err)
+		t.Fatalf("status: %v", err)
 	}
 	if report.Campaign != nil {
-		t.Fatalf("кампания взялась из пустой базы: %+v", report.Campaign)
+		t.Fatalf("campaign came out of an empty database: %+v", report.Campaign)
 	}
 	if len(report.Accounts) != 1 || report.Accounts[0].Label != "test" {
-		t.Fatalf("аккаунты в отчёте: %+v", report.Accounts)
+		t.Fatalf("accounts in the report: %+v", report.Accounts)
 	}
 }
 
-// Наполненная кампания: счётчики по состояниям, дневной расход аккаунта,
-// превью на реальных строках и построчный итог по full.
+// A populated campaign: counters by state, the account's daily usage, the
+// preview on real rows and the per-row result with full.
 func TestStatusCountsStatesAndPreview(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -33,48 +33,48 @@ func TestStatusCountsStatesAndPreview(t *testing.T) {
 	startWith(t, service, person(1, "ivan_petrov"), person(2, "petr_ivanov"))
 	sender := senderOn(service, &stubTransport{})
 	if err := sender.step(ctx); err != nil {
-		t.Fatalf("виток отправщика: %v", err)
+		t.Fatalf("sender step: %v", err)
 	}
 
 	report, err := service.Status(ctx, true)
 	if err != nil {
-		t.Fatalf("статус: %v", err)
+		t.Fatalf("status: %v", err)
 	}
 	if report.Campaign == nil || report.Campaign.Total != 2 {
-		t.Fatalf("кампания в отчёте: %+v", report.Campaign)
+		t.Fatalf("campaign in the report: %+v", report.Campaign)
 	}
 	if report.Campaign.States["sent"] != 1 || report.Campaign.States["planned"] != 1 {
-		t.Fatalf("счётчики состояний: %+v", report.Campaign.States)
+		t.Fatalf("state counters: %+v", report.Campaign.States)
 	}
 	if report.Accounts[0].UsedToday != 1 {
-		t.Fatalf("дневной расход аккаунта: %+v", report.Accounts[0])
+		t.Fatalf("account daily usage: %+v", report.Accounts[0])
 	}
 	if len(report.Preview) != 2 || !strings.Contains(report.Preview[0].Text, "Иван") {
-		t.Fatalf("превью: %+v", report.Preview)
+		t.Fatalf("preview: %+v", report.Preview)
 	}
 	if len(report.Rows) != 2 || report.Rows[0].State != "sent" {
-		t.Fatalf("построчный итог: %+v", report.Rows)
+		t.Fatalf("per-row result: %+v", report.Rows)
 	}
 
-	// Оставшаяся строка закреплена за чужим аккаунтом: её не возьмёт никто,
-	// кроме него, и отчёт обязан назвать, чьего отправщика ждёт очередь.
+	// The remaining row is pinned to another account: nobody but that account
+	// takes it, and the report must name whose sender the queue is waiting for.
 	if _, err := service.pool.Exec(ctx,
 		`WITH other AS (INSERT INTO accounts (label, daily_limit) VALUES ('second', 10) RETURNING id)
 		 UPDATE recipients SET account_id = (SELECT id FROM other) WHERE state = 'planned'`); err != nil {
-		t.Fatalf("закрепить строку за чужим аккаунтом: %v", err)
+		t.Fatalf("pin the row to another account: %v", err)
 	}
 	report, err = service.Status(ctx, false)
 	if err != nil {
-		t.Fatalf("статус: %v", err)
+		t.Fatalf("status: %v", err)
 	}
 	if len(report.Held) != 1 || report.Held[0].Label != "second" || report.Held[0].Rows != 1 {
-		t.Fatalf("строки за чужим аккаунтом: %+v", report.Held)
+		t.Fatalf("rows held by another account: %+v", report.Held)
 	}
 }
 
-// Среди закрытых кампаний свежесть решает finished_at, а не id: кампания,
-// закрывшаяся позже, обязана выигрывать в статусе без параметра, даже если её
-// id меньше, чем у кампании, закрытой раньше.
+// Among closed campaigns recency is decided by finished_at, not id: the
+// campaign that closed later must win in a status call without parameters,
+// even if its id is smaller than that of the campaign closed earlier.
 func TestStatusPrefersLastClosedOverBiggerID(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -82,45 +82,46 @@ func TestStatusPrefersLastClosedOverBiggerID(t *testing.T) {
 	doneID := startWith(t, service, person(1, "ivan_petrov"))
 	claimed, err := service.ClaimNext(ctx, "test")
 	if err != nil || claimed == nil {
-		t.Fatalf("взять строку: %v, %+v", err, claimed)
+		t.Fatalf("claim a row: %v, %+v", err, claimed)
 	}
 	if _, err := service.FinishClaim(ctx, claimed, ResultSent, ""); err != nil {
-		t.Fatalf("финализация: %v", err)
+		t.Fatalf("finalize: %v", err)
 	}
-	// Закрывается позже второй кампании, хотя её id меньше.
+	// Closes later than the second campaign although its id is smaller.
 	service.Now = func() time.Time { return testNow.Add(2 * time.Hour) }
 	if done, err := service.FinishIfEmpty(ctx); err != nil || !done {
-		t.Fatalf("закрыть первую кампанию: %v, done=%v", err, done)
+		t.Fatalf("close the first campaign: %v, done=%v", err, done)
 	}
 
-	cancelledID, err := service.LoadCampaign(ctx, "Привет, {имя}!", "вторая")
+	cancelledID, err := service.LoadCampaign(ctx, "Привет, {имя}!", "second")
 	if err != nil {
-		t.Fatalf("создать вторую кампанию: %v", err)
+		t.Fatalf("create the second campaign: %v", err)
 	}
 	if _, err := service.AddRecipients(ctx, cancelledID, []Person{person(2, "petr_ivanov")}); err != nil {
-		t.Fatalf("добавить получателей во вторую: %v", err)
+		t.Fatalf("add recipients to the second: %v", err)
 	}
 	if _, err := service.StartCampaign(ctx); err != nil {
-		t.Fatalf("запустить вторую: %v", err)
+		t.Fatalf("start the second: %v", err)
 	}
-	// Закрывается раньше первой по времени, но её id больше.
+	// Closes earlier than the first by time, but its id is bigger.
 	service.Now = func() time.Time { return testNow.Add(time.Hour) }
 	if id, err := service.StopCampaign(ctx, true); err != nil || id != cancelledID {
-		t.Fatalf("отменить вторую: id %d, err %v", id, err)
+		t.Fatalf("cancel the second: id %d, err %v", id, err)
 	}
 
 	status, err := service.Status(ctx, false)
 	if err != nil {
-		t.Fatalf("статус: %v", err)
+		t.Fatalf("status: %v", err)
 	}
 	if status.Campaign == nil || status.Campaign.ID != doneID {
-		t.Fatalf("статус без параметра показал не последнюю закрытую кампанию: %+v, ожидали id %d", status.Campaign, doneID)
+		t.Fatalf("status without parameters showed not the last closed campaign: %+v, expected id %d", status.Campaign, doneID)
 	}
 }
 
-// secondAccount заводит второго отправщика на том же пуле: своя метка, всё
-// остальное - как у первого. Ровно так второй аккаунт появляется в жизни:
-// процесс поднимается со своей меткой и заводит строку сам.
+// secondAccount creates a second sender on the same pool: its own label,
+// everything else as for the first. This is exactly how a second account
+// appears in real life: the process starts with its own label and creates the
+// row itself.
 func secondAccount(t *testing.T, service *Service, label string) *Service {
 	t.Helper()
 	cfg := service.cfg
@@ -128,14 +129,14 @@ func secondAccount(t *testing.T, service *Service, label string) *Service {
 	other := NewService(service.pool, cfg)
 	other.Now = service.Now
 	if _, _, err := other.EnsureAccount(context.Background()); err != nil {
-		t.Fatalf("завести аккаунт %q: %v", label, err)
+		t.Fatalf("create account %q: %v", label, err)
 	}
 	return other
 }
 
-// Два отправщика на одной кампании: строку получает каждый, но свою. Это рубеж
-// «один человек - одно сообщение» на пути, которого раньше не было: до
-// нескольких аккаунтов две выборки подряд шли из одного процесса.
+// Two senders on one campaign: each gets a row, but its own. This is the "one
+// person, one message" guard on a path that did not exist before: before
+// several accounts, two consecutive claims came from one process.
 func TestTwoAccountsSplitQueue(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -145,30 +146,30 @@ func TestTwoAccountsSplitQueue(t *testing.T) {
 
 	first, err := service.ClaimNext(ctx, "test")
 	if err != nil || first == nil {
-		t.Fatalf("выборка первым аккаунтом: %v, %+v", err, first)
+		t.Fatalf("claim by the first account: %v, %+v", err, first)
 	}
 	other, err := service.ClaimNext(ctx, "second")
 	if err != nil || other == nil {
-		t.Fatalf("выборка вторым аккаунтом: %v, %+v", err, other)
+		t.Fatalf("claim by the second account: %v, %+v", err, other)
 	}
 	if first.Username == other.Username {
-		t.Fatalf("оба аккаунта взяли одного человека: %q", first.Username)
+		t.Fatalf("both accounts took the same person: %q", first.Username)
 	}
 
-	// Третьей строки нет: очередь кончилась, и третья выборка не имеет права
-	// отдать кого-то из уже взятых.
+	// There is no third row: the queue is empty, and a third claim must not hand
+	// out anyone already taken.
 	extra, err := service.ClaimNext(ctx, "second")
 	if err != nil {
-		t.Fatalf("третья выборка: %v", err)
+		t.Fatalf("third claim: %v", err)
 	}
 	if extra != nil {
-		t.Fatalf("очередь отдала лишнюю строку: %+v", extra)
+		t.Fatalf("the queue handed out an extra row: %+v", extra)
 	}
 }
 
-// Стоп одного аккаунта не трогает соседа и виден в его строке отчёта: причина
-// молчания считается по каждому аккаунту, иначе «почему второй молчит» снаружи
-// не имеет ответа.
+// A stop of one account does not touch its neighbour and is visible in its
+// report line: the idle reason is computed per account, otherwise "why is the
+// second one silent" has no answer from outside.
 func TestStatusIdlePerAccount(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -176,46 +177,46 @@ func TestStatusIdlePerAccount(t *testing.T) {
 	startWith(t, service, person(1, "ivan_petrov"), person(2, "petr_ivanov"))
 	secondAccount(t, service, "second")
 	if err := service.StopAccount(ctx, "test", "PEER_FLOOD"); err != nil {
-		t.Fatalf("стоп аккаунта: %v", err)
+		t.Fatalf("account stop: %v", err)
 	}
 
 	report, err := service.Status(ctx, false)
 	if err != nil {
-		t.Fatalf("статус: %v", err)
+		t.Fatalf("status: %v", err)
 	}
 	if len(report.Accounts) != 2 {
-		t.Fatalf("аккаунты в отчёте: %+v", report.Accounts)
+		t.Fatalf("accounts in the report: %+v", report.Accounts)
 	}
 	byLabel := map[string]AccountSummary{}
 	for _, item := range report.Accounts {
 		byLabel[item.Label] = item
 	}
 	if got := byLabel["test"].Idle.Reason; got != IdleAccountStop {
-		t.Fatalf("причина простоя остановленного аккаунта: %q", got)
+		t.Fatalf("idle reason of the stopped account: %q", got)
 	}
 	if got := byLabel["second"].Idle.Reason; got != IdleClaimRaceLost {
-		t.Fatalf("причина простоя живого аккаунта: %q", got)
+		t.Fatalf("idle reason of the live account: %q", got)
 	}
-	// Общей строки нет: причины разные, и одна на всех спрятала бы стоп.
+	// There is no shared line: the reasons differ, and one for all would hide the stop.
 	if report.Idle.Reason != "" {
-		t.Fatalf("общая причина простоя при разных причинах: %+v", report.Idle)
+		t.Fatalf("shared idle reason despite different reasons: %+v", report.Idle)
 	}
 
-	// Живой аккаунт продолжает работу: стоп соседа его не останавливает.
+	// The live account keeps working: its neighbour's stop does not stop it.
 	picked, err := service.ClaimNext(ctx, "second")
 	if err != nil || picked == nil {
-		t.Fatalf("выборка живым аккаунтом после стопа соседа: %v, %+v", err, picked)
+		t.Fatalf("claim by the live account after its neighbour's stop: %v, %+v", err, picked)
 	}
 }
 
-// Общая причина остаётся одной строкой: окно отправки, кампания и её шаблон
-// одни на все аккаунты, и повторять их у каждого значит спрятать среди них ту
-// единственную, которая отличается.
+// A shared reason stays one line: the send window, the campaign and its
+// template are the same for all accounts, and repeating them for each would
+// bury the one reason that differs.
 func TestCommonIdleCollapses(t *testing.T) {
 	window := Idle{Reason: IdleWindowClosed}
 	both := []AccountSummary{{Label: "a", Idle: window}, {Label: "b", Idle: window}}
 	if got := commonIdle(both).Reason; got != IdleWindowClosed {
-		t.Fatalf("совпавшая общая причина не схлопнулась: %q", got)
+		t.Fatalf("matching shared reason did not collapse: %q", got)
 	}
 
 	limits := []AccountSummary{
@@ -223,12 +224,12 @@ func TestCommonIdleCollapses(t *testing.T) {
 		{Label: "b", Idle: Idle{Reason: IdleDailyLimit, Used: 7, Limit: 20}},
 	}
 	if got := commonIdle(limits).Reason; got != "" {
-		t.Fatalf("аккаунтная причина ушла в общую строку с чужими числами: %q", got)
+		t.Fatalf("per-account reason leaked into the shared line with foreign numbers: %q", got)
 	}
 
-	// Аккаунт один - строка общая, как и до нескольких отправщиков.
+	// With one account the line is shared, as before several senders existed.
 	single := []AccountSummary{{Label: "a", Idle: Idle{Reason: IdleDailyLimit, Used: 3, Limit: 3}}}
 	if got := commonIdle(single).Reason; got != IdleDailyLimit {
-		t.Fatalf("единственный аккаунт потерял общую строку: %q", got)
+		t.Fatalf("the only account lost the shared line: %q", got)
 	}
 }

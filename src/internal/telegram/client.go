@@ -1,16 +1,17 @@
-// Package telegram - userbot на MTProto: одна сессия живого аккаунта, чтение
-// входящих и отправка.
+// Package telegram is an MTProto userbot: one session of a live account,
+// reading incoming messages and sending.
 //
-// Userbot, а не Bot API, потому что аккаунт настоящий: он состоит в чатах,
-// пишет в личку людям, которые бота бы не запустили, и виден в переписке как
-// человек. Цена - сессия привязана к номеру и живёт ровно в одном процессе:
-// второй процесс с тем же номером разлогинивает первый.
+// A userbot, not the Bot API, because the account is real: it is a member of
+// chats, writes in private to people who would not start a bot, and is visible
+// in the correspondence as a person. The price is that the session is tied to a
+// number and lives in exactly one process: a second process with the same
+// number logs the first one out.
 //
-// Пакет не решает, что делать с сообщением. Он приводит апдейт к структуре и
-// отдаёт наверх: отбор по виду адресата, по отправителю и по содержанию - дело
-// сервиса, и у каждого он свой.
+// The package does not decide what to do with a message. It turns an update
+// into a structure and passes it up: selection by recipient kind, by sender and
+// by content is the service's business, and differs for each service.
 //
-// Перенесено из qualifier, где отработало в проде.
+// Ported from an earlier internal project, where it ran in production.
 package telegram
 
 import (
@@ -53,32 +54,32 @@ var (
 
 const sessionKey = "userbot"
 
-// dialogsBatch - страница обхода диалогов при прогреве. Дефолт библиотеки
-// равен единице, то есть один RPC на каждый диалог.
+// dialogsBatch is the page size of the dialog walk during warm-up. The library
+// default is one, that is, one RPC per dialog.
 const dialogsBatch = 100
 
-// primeRetry - пауза между повторами прогрева.
+// primeRetry is the pause between warm-up retries.
 const primeRetry = time.Minute
 
-// Config - настройки клиента.
+// Config holds the client settings.
 type Config struct {
 	AppID   int
 	AppHash string
 	Phone   string
-	// StoragePath - файл bolt с сессией, peer storage и состоянием апдейтов.
-	// Каталог обязан быть выделенным и с правами 0700: там лежит доступ к
-	// живому аккаунту.
+	// StoragePath is the bolt file with the session, peer storage and update
+	// state. The directory must be dedicated and have mode 0700: it holds access
+	// to the live account.
 	StoragePath string
-	// ProxyURL - `socks5://host:port` или пусто. Прокси задаётся клиенту, а не
-	// окружению процесса: на хостах закрыт прямой путь не ко всему сразу.
+	// ProxyURL is `socks5://host:port` or empty. The proxy is set on the client,
+	// not on the process environment: on some hosts the direct path is closed not to everything at once.
 	ProxyURL string
-	// PrimePeers - обойти диалоги при старте, чтобы наполнить peer storage.
+	// PrimePeers walks the dialogs at startup to fill the peer storage.
 	//
-	// Нужен, только если сервис пишет в группу первым. Access hash группы
-	// попадает в хранилище из апдейта, а молчащий месяцами чат апдейтов не
-	// даёт, и первая отправка туда упала бы «peer не найден». Если сервис
-	// только отвечает на входящие, прогрев не нужен: на боевом аккаунте обход
-	// всех диалогов упирается в FLOOD_WAIT.
+	// Needed only if the service writes to a group first. A group's access hash
+	// reaches storage from an update, and a chat silent for months gives no
+	// updates, so the first send there would fail with "peer not found". If the
+	// service only answers incoming messages, warm-up is not needed: on a live
+	// account walking all dialogs runs into FLOOD_WAIT.
 	PrimePeers bool
 }
 
@@ -99,81 +100,81 @@ func (c Config) validate() error {
 	return err
 }
 
-// Message - входящее сообщение, приведённое к плоскому виду.
+// Message is an incoming message reduced to a flat form.
 type Message struct {
-	// Peer - чат, в котором сообщение: человек, группа или канал.
+	// Peer is the chat the message is in: a person, a group or a channel.
 	Peer Ref
-	// SenderID - кто написал. В личке совпадает с адресатом, в группе нет.
+	// SenderID is who wrote. In a private chat it equals the recipient, in a group it does not.
 	SenderID int64
-	// ID - идентификатор сообщения внутри чата.
+	// ID is the message identifier within the chat.
 	ID int
-	// Username и Name известны не всегда: короткие апдейты их не несут.
+	// Username and Name are not always known: short updates do not carry them.
 	Username string
 	Name     string
 	Text     string
-	// MediaKind - вид вложения или пусто, если сообщение текстовое:
-	// photo, document, geo, contact, poll, other. Web-preview вложением не
-	// считается, это оформление ссылки в тексте.
+	// MediaKind is the attachment kind or empty if the message is text:
+	// photo, document, geo, contact, poll, other. A web preview does not count as
+	// an attachment, it is the formatting of a link in the text.
 	MediaKind string
 	SentAt    time.Time
-	// Outgoing - сообщение отправлено с нашего аккаунта. Такие апдейты приходят
-	// тоже: с того же номера может писать человек руками, и его реплика обычно
-	// важна сервису не меньше входящей.
+	// Outgoing means the message was sent from our account. Such updates arrive
+	// too: a person may write by hand from the same number, and their reply is
+	// usually as important to the service as an incoming one.
 	Outgoing bool
 }
 
-// Handler вызывается на каждое сообщение. Ошибка попадает в лог библиотеки и
-// апдейт не переигрывается: обязательства сервиса живут в его БД, а не в
-// доставке апдейтов.
+// Handler is called for every message. An error goes to the library log and the
+// update is not replayed: the service's obligations live in its DB, not in
+// update delivery.
 type Handler func(ctx context.Context, msg Message) error
 
-// SendResult - что вышло из отправки.
+// SendResult is what came out of a send.
 type SendResult struct {
 	MessageID int
-	// Duplicate - Telegram узнал RandomID и второе сообщение не создал. Это
-	// успех, а не ошибка: так и работает защита от двойной отправки.
+	// Duplicate means Telegram recognized the RandomID and did not create a second
+	// message. This is a success, not an error: that is how protection against double sending works.
 	Duplicate bool
 }
 
-// Media - вложение. Вид выводится из расширения имени.
+// Media is an attachment. The kind is derived from the file name extension.
 type Media struct {
 	Name string
 	Data []byte
 }
 
-// Client - запущенный userbot.
+// Client is a running userbot.
 type Client struct {
 	cfg     Config
 	handler Handler
-	// mu защищает api и peers: их ставит и обнуляет горутина Run, а читают
-	// обработчики MCP из своих. Без замка остановка сервиса роняет висящий
-	// вызов на nil.
+	// mu protects api and peers: they are set and cleared by the Run goroutine and
+	// read by the MCP handlers from their own. Without the lock a service stop
+	// drops a pending call on nil.
 	mu    sync.RWMutex
 	api   *tg.Client
 	peers storage.PeerStorage
 }
 
-// session отдаёт живую сессию или отказ, если клиент не запущен.
+// session returns the live session or a refusal if the client is not started.
 //
-// Возвращаются копии: держатель копии переживёт обнуление полей, а gotd на
-// закрытом соединении вернёт обычную ошибку - ждать читателей не нужно.
+// Copies are returned: the holder of a copy survives the fields being cleared,
+// and gotd on a closed connection returns an ordinary error - there is no need to wait for readers.
 func (c *Client) session() (*tg.Client, storage.PeerStorage, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.api == nil || c.peers == nil {
-		return nil, nil, &Failure{Kind: KindNotReady, Message: "клиент не запущен"}
+		return nil, nil, &Failure{Kind: KindNotReady, Message: "client not started"}
 	}
 	return c.api, c.peers, nil
 }
 
-// setSession ставит сессию на время работы Run и снимает её по выходу.
+// setSession sets the session for the duration of Run and clears it on exit.
 func (c *Client) setSession(api *tg.Client, peers storage.PeerStorage) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.api, c.peers = api, peers
 }
 
-// New собирает клиента. Сеть при этом не трогается: соединение поднимает Run.
+// New builds a client. The network is not touched: Run brings up the connection.
 func New(cfg Config, handler Handler) (*Client, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -184,9 +185,9 @@ func New(cfg Config, handler Handler) (*Client, error) {
 	return &Client{cfg: cfg, handler: handler}, nil
 }
 
-// Run поднимает сессию и держит её, пока не кончится ctx или не упадёт run.
-// Вся работа сервиса с Telegram живёт внутри run: снаружи клиент не запущен, и
-// отправка вернёт KindNotReady.
+// Run brings up the session and holds it until ctx ends or run fails.
+// All of the service's work with Telegram lives inside run: outside it the
+// client is not started, and a send returns KindNotReady.
 func (c *Client) Run(ctx context.Context, run func(context.Context) error) error {
 	if run == nil {
 		return errors.New("telegram: run callback is required")
@@ -236,9 +237,9 @@ func (c *Client) Run(ctx context.Context, run func(context.Context) error) error
 	})
 }
 
-// serve держит три вещи разом: приём апдейтов, прогрев адресатов и работу
-// сервиса. Любая из них, кончившись, останавливает остальные - иначе сервис
-// продолжал бы слать сообщения, перестав слышать ответы.
+// serve holds three things at once: receiving updates, warming up recipients and
+// the service's work. Any of them ending stops the others - otherwise the
+// service would keep sending messages after it stopped hearing the replies.
 func (c *Client) serve(
 	ctx context.Context,
 	api *tg.Client,
@@ -267,9 +268,9 @@ func (c *Client) serve(
 		return group.Wait()
 	}
 
-	// Прогрев идёт до работы сервиса, но его сбой старт не отменяет: без него
-	// не работает только отправка первым в молчащую группу. Неудачу добираем
-	// фоном, иначе одна временная ошибка выключала бы её до рестарта.
+	// Warm-up runs before the service's work, but its failure does not cancel the start: without it
+	// only sending first into a silent group does not work. The failure is retried
+	// in the background, otherwise one temporary error would disable it until restart.
 	if c.cfg.PrimePeers {
 		if err := c.primePeers(groupCtx); err != nil {
 			slog.Warn("telegram peers prime failed", "error", err)
@@ -287,22 +288,22 @@ func (c *Client) serve(
 	return group.Wait()
 }
 
-// SendText отправляет текст.
+// SendText sends text.
 //
-// randomID - ключ идемпотентности Telegram: повтор с тем же значением не создаёт
-// второго сообщения, а возвращает Duplicate. Значение обязано быть привязано к
-// намерению сервиса (работа очереди, событие), а не сгенерировано на каждый
-// вызов, иначе защиты нет.
+// randomID is the Telegram idempotency key: a retry with the same value does not
+// create a second message but returns Duplicate. The value must be tied to a
+// service intent (a queue job, an event), not generated on every call,
+// otherwise there is no protection.
 func (c *Client) SendText(ctx context.Context, peer Ref, text string, randomID int64) (SendResult, error) {
 	api, peers, err := c.session()
 	if err != nil {
 		return SendResult{}, err
 	}
 	if strings.TrimSpace(text) == "" {
-		return SendResult{}, permanent(KindBadRequest, "пустой текст сообщения")
+		return SendResult{}, permanent(KindBadRequest, "empty message text")
 	}
 	if randomID == 0 {
-		return SendResult{}, permanent(KindBadRequest, "random_id равен нулю")
+		return SendResult{}, permanent(KindBadRequest, "random_id is zero")
 	}
 
 	target, err := resolve(ctx, peers, peer)
@@ -318,10 +319,10 @@ func (c *Client) SendText(ctx context.Context, peer Ref, text string, randomID i
 	}))
 }
 
-// splitPre переводит первый блок между "```\n" и "\n```" в сущность pre:
-// API, в отличие от клиента Telegram, разметку в тексте не разбирает, а таблице
-// сводки нужны ровные колонки. Границы из текста убираются; пары нет - текст
-// уходит как есть.
+// splitPre turns the first block between "```\n" and "\n```" into a pre entity:
+// the API, unlike the Telegram client, does not parse markup in the text, and a
+// digest table needs even columns. The delimiters are removed from the text; with no pair the text
+// goes out as is.
 func splitPre(text string) (string, []tg.MessageEntityClass) {
 	const open, closing = "```\n", "\n```"
 	start := strings.Index(text, open)
@@ -338,24 +339,24 @@ func splitPre(text string) (string, []tg.MessageEntityClass) {
 	return text[:start] + block + body[end+len(closing):], []tg.MessageEntityClass{pre}
 }
 
-// utf16Len - длина в единицах UTF-16: так Telegram меряет смещения сущностей.
+// utf16Len is the length in UTF-16 units: that is how Telegram measures entity offsets.
 func utf16Len(text string) int {
 	return len(utf16.Encode([]rune(text)))
 }
 
-// SendMedia отправляет вложение одним сообщением. Файл грузится на каждую
-// отправку заново: кеш file_id пришлось бы сбрасывать при переезде сессии, а
-// выигрыш заметен только при массовой рассылке одного и того же файла.
+// SendMedia sends an attachment as one message. The file is uploaded anew on
+// every send: a file_id cache would have to be reset when the session moves, and
+// the gain is noticeable only when mass-sending the same file.
 func (c *Client) SendMedia(ctx context.Context, peer Ref, media Media, caption string, randomID int64) (SendResult, error) {
 	api, peers, err := c.session()
 	if err != nil {
 		return SendResult{}, err
 	}
 	if randomID == 0 {
-		return SendResult{}, permanent(KindBadRequest, "random_id равен нулю")
+		return SendResult{}, permanent(KindBadRequest, "random_id is zero")
 	}
-	// Разбор формы идёт до аплоада: неизвестное расширение обязано отсечься
-	// раньше, чем сервис потратит загрузку файла.
+	// The shape is parsed before the upload: an unknown extension must be rejected
+	// before the service spends a file upload.
 	input, text, err := mediaInput(media.Name, caption)
 	if err != nil {
 		return SendResult{}, err
@@ -385,7 +386,7 @@ func (c *Client) SendMedia(ctx context.Context, peer Ref, media Media, caption s
 	}))
 }
 
-// SetTyping показывает адресату индикатор набора.
+// SetTyping shows the recipient a typing indicator.
 func (c *Client) SetTyping(ctx context.Context, peer Ref) error {
 	api, peers, err := c.session()
 	if err != nil {
@@ -402,7 +403,7 @@ func (c *Client) SetTyping(ctx context.Context, peer Ref) error {
 	return classify(err)
 }
 
-// MarkRead ставит галочку прочтения до maxID включительно. Идемпотентен.
+// MarkRead sets the read mark up to and including maxID. Idempotent.
 func (c *Client) MarkRead(ctx context.Context, peer Ref, maxID int) error {
 	api, peers, err := c.session()
 	if err != nil {
@@ -419,11 +420,11 @@ func (c *Client) MarkRead(ctx context.Context, peer Ref, maxID int) error {
 	return classify(err)
 }
 
-// ResolveUsername переводит ник в ссылку на адресата и запоминает access hash,
-// поэтому следующая отправка уже не спрашивает Telegram.
+// ResolveUsername turns a username into a recipient reference and remembers the
+// access hash, so the next send does not ask Telegram again.
 //
-// Отсутствующий ник отделён от временного отказа намеренно: по первому сервис
-// решает, что человека не найти, по второму - что попробует позже.
+// A missing username is deliberately separated from a temporary refusal: on the
+// first the service decides the person cannot be found, on the second that it will try later.
 func (c *Client) ResolveUsername(ctx context.Context, username string) (Ref, error) {
 	api, peers, err := c.session()
 	if err != nil {
@@ -431,20 +432,20 @@ func (c *Client) ResolveUsername(ctx context.Context, username string) (Ref, err
 	}
 	username = strings.TrimPrefix(strings.TrimSpace(username), "@")
 	if username == "" {
-		return "", permanent(KindBadRequest, "пустой username")
+		return "", permanent(KindBadRequest, "empty username")
 	}
 
 	resolved, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
 	if err != nil {
 		if tgerr.Is(err, "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID") {
-			return "", permanent(KindPeerForbidden, "username не найден")
+			return "", permanent(KindPeerForbidden, "username not found")
 		}
 		return "", classify(err)
 	}
 
 	user, ok := resolved.Peer.(*tg.PeerUser)
 	if !ok {
-		return "", permanent(KindNotPerson, "username принадлежит не человеку")
+		return "", permanent(KindNotPerson, "username does not belong to a person")
 	}
 	var found storage.Peer
 	for _, candidate := range resolved.Users {
@@ -453,7 +454,7 @@ func (c *Client) ResolveUsername(ctx context.Context, username string) (Ref, err
 		}
 	}
 	if found.User == nil {
-		return "", permanent(KindPeerForbidden, "resolve не вернул пользователя")
+		return "", permanent(KindPeerForbidden, "resolve did not return a user")
 	}
 	if err := peers.Add(ctx, found); err != nil {
 		return "", fmt.Errorf("persist resolved telegram peer: %w", err)
@@ -461,17 +462,17 @@ func (c *Client) ResolveUsername(ctx context.Context, username string) (Ref, err
 	return NewRef(KindUser, user.UserID), nil
 }
 
-// resolve - общая преамбула обращений к адресату: ссылка разобрана, адресат
-// найден. Хранилище приходит аргументом, а не читается из полей клиента: снять
-// сессию может остановка сервиса посреди вызова.
+// resolve is the common preamble of calls to a recipient: the reference is
+// parsed, the recipient is found. The storage comes as an argument, not read
+// from the client fields: a service stop can clear the session mid-call.
 //
-// Обычная группа - исключение: она адресуется одним id, access hash ей не
-// нужен, поэтому хранилище не спрашиваем вовсе. Иначе отправка в такую группу
-// зависела бы от прогрева, а он на боевом аккаунте упирается в FLOOD_WAIT.
+// A regular group is an exception: it is addressed by an id alone, no access hash
+// is needed, so we do not ask the storage at all. Otherwise a send to such a group
+// would depend on warm-up, which on a live account runs into FLOOD_WAIT.
 func resolve(ctx context.Context, peers storage.PeerStorage, peer Ref) (tg.InputPeerClass, error) {
 	kind, id, err := peer.Split()
 	if err != nil {
-		return nil, permanent(KindBadRequest, "некорректная ссылка на адресата")
+		return nil, permanent(KindBadRequest, "invalid recipient reference")
 	}
 
 	var key tg.PeerClass
@@ -488,17 +489,17 @@ func resolve(ctx context.Context, peers storage.PeerStorage, peer Ref) (tg.Input
 		if errors.Is(err, storage.ErrPeerNotFound) {
 			return nil, classify(err)
 		}
-		// Отказало своё хранилище, а не Telegram: запрос не уходил, и сообщения
-		// заведомо нет. Отдельный вид нужен именно поэтому - KindTemporary означал
-		// бы «доставка неизвестна» и оставил бы касание в pending навсегда, хотя
-		// сеть не трогали (закрытый по SIGTERM bolt отвечает так же).
-		return nil, &Failure{Kind: KindStorage, Message: "хранилище адресатов недоступно: " + err.Error()}
+		// Our own storage failed, not Telegram: the request did not go out, and the
+		// message certainly does not exist. A separate kind is needed exactly for this -
+		// KindTemporary would mean "delivery unknown" and leave the touch in pending
+		// forever, although the network was not touched (a bolt closed by SIGTERM answers the same way).
+		return nil, &Failure{Kind: KindStorage, Message: "recipient storage unavailable: " + err.Error()}
 	}
 	return found.AsInputPeer(), nil
 }
 
-// sent - общий хвост обеих отправок: дубль это успех, остальное разбирается
-// одинаково.
+// sent is the common tail of both sends: a duplicate is a success, the rest is
+// handled the same way.
 func sent(result tg.UpdatesClass, err error) (SendResult, error) {
 	if err != nil {
 		if tg.IsRandomIDDuplicate(err) {
@@ -513,18 +514,18 @@ func sent(result tg.UpdatesClass, err error) (SendResult, error) {
 	return SendResult{MessageID: id}, nil
 }
 
-// Формат видеостикера Telegram: квадрат 512 точек и эмодзи-подпись для
-// клиентов, которые показывают её вместо картинки.
+// The Telegram video sticker format: a 512-point square and an emoji caption for
+// clients that show it instead of the picture.
 const (
 	stickerSide = 512
 	stickerAlt  = "\U0001F431"
 )
 
-// mediaInput - вид вложения и подпись к нему по расширению файла.
+// mediaInput returns the attachment kind and the caption for it by file extension.
 //
-// Длительность видео не заявляем: её посчитает сервер, а неверное число
-// исказило бы показ. У стикера подпись снимается: Telegram показывает её
-// отдельным блоком, и лёгкое касание перестаёт быть лёгким.
+// The video duration is not declared: the server computes it, and a wrong number
+// would distort the display. A sticker's caption is removed: Telegram shows it as
+// a separate block, and a light touch stops being light.
 func mediaInput(name, caption string) (tg.InputMediaClass, string, error) {
 	switch strings.ToLower(filepath.Ext(name)) {
 	case ".jpg", ".jpeg", ".png":
@@ -538,11 +539,11 @@ func mediaInput(name, caption string) (tg.InputMediaClass, string, error) {
 			},
 		}, "", nil
 	default:
-		return nil, "", permanent(KindMediaInvalid, "неизвестный вид вложения: "+name)
+		return nil, "", permanent(KindMediaInvalid, "unknown attachment kind: "+name)
 	}
 }
 
-// primePeers наполняет peer storage из списка диалогов.
+// primePeers fills the peer storage from the dialog list.
 func (c *Client) primePeers(ctx context.Context) error {
 	api, peers, err := c.session()
 	if err != nil {
@@ -556,7 +557,7 @@ func (c *Client) primePeers(ctx context.Context) error {
 	return nil
 }
 
-// retryPrime добирает прогрев после неудачи и уходит по отмене контекста.
+// retryPrime completes warm-up after a failure and exits on context cancel.
 func (c *Client) retryPrime(ctx context.Context) {
 	for {
 		select {
@@ -572,12 +573,12 @@ func (c *Client) retryPrime(ctx context.Context) {
 	}
 }
 
-// normalize приводит апдейт к Message. Второе значение false означает, что
-// разбирать нечего: служебный апдейт или сообщение без текста и вложения.
+// normalize turns an update into a Message. A second value of false means
+// there is nothing to parse: a service update or a message without text and attachment.
 //
-// Отбора по виду адресата и по отправителю здесь нет намеренно: сервису,
-// который слушает только личку, и сервису, который читает каналы, нужны разные
-// правила, а пакет один.
+// There is deliberately no selection by recipient kind and by sender here: a
+// service that listens only to private chats and a service that reads channels
+// need different rules, and the package is one.
 func normalize(update *tg.UpdateNewMessage, entities tg.Entities) (Message, bool) {
 	if update == nil {
 		return Message{}, false
@@ -589,8 +590,8 @@ func normalize(update *tg.UpdateNewMessage, entities tg.Entities) (Message, bool
 	return fromMessage(message, entities)
 }
 
-// fromMessage приводит сообщение к Message. Общая часть апдейта и ответа на
-// запрос истории: форма сообщения там одна и та же.
+// fromMessage turns a message into a Message. The part shared by an update and
+// a history query response: the message shape there is the same.
 func fromMessage(message *tg.Message, entities tg.Entities) (Message, bool) {
 	peer, ok := refFromPeer(message.GetPeerID())
 	if !ok {
@@ -603,7 +604,7 @@ func fromMessage(message *tg.Message, entities tg.Entities) (Message, bool) {
 		return Message{}, false
 	}
 
-	// Отправитель: в личке FromID пуст, и им является сам адресат.
+	// Sender: in a private chat FromID is empty, and it is the recipient themselves.
 	sender := int64(0)
 	if from, ok := message.GetFromID(); ok {
 		if user, ok := from.(*tg.PeerUser); ok {
@@ -629,8 +630,8 @@ func fromMessage(message *tg.Message, entities tg.Entities) (Message, bool) {
 	}, true
 }
 
-// mediaKind - грубая категория вложения или пусто. Web-preview и пустое медиа
-// вложением не считаются: это оформление текстового сообщения.
+// mediaKind is a rough attachment category or empty. A web preview and empty
+// media do not count as an attachment: they are the formatting of a text message.
 func mediaKind(media tg.MessageMediaClass) string {
 	switch media.(type) {
 	case nil, *tg.MessageMediaEmpty, *tg.MessageMediaWebPage:
@@ -650,8 +651,8 @@ func mediaKind(media tg.MessageMediaClass) string {
 	}
 }
 
-// username берёт публичный ник: сначала основное поле, затем первый активный
-// из коллекционных (аккаунты с несколькими никами). Пусто - ник неизвестен.
+// username takes the public username: first the main field, then the first
+// active one of the collectible ones (accounts with several usernames). Empty means the username is unknown.
 func username(entities tg.Entities, userID int64) string {
 	user, ok := entities.Users[userID]
 	if !ok || user == nil {
@@ -660,13 +661,13 @@ func username(entities tg.Entities, userID int64) string {
 	return publicUsername(user)
 }
 
-// publicUsername - основной ник или первый активный из коллекционных.
+// publicUsername is the main username or the first active collectible one.
 func publicUsername(user *tg.User) string {
 	return pickUsername(user.Username, user.Usernames)
 }
 
-// name собирает имя отправителя. Пусто - штатный случай: короткие апдейты
-// entities не несут.
+// name builds the sender name. Empty is the normal case: short updates
+// carry no entities.
 func name(entities tg.Entities, userID int64) string {
 	user, ok := entities.Users[userID]
 	if !ok || user == nil {
@@ -675,12 +676,12 @@ func name(entities tg.Entities, userID int64) string {
 	return fullName(user)
 }
 
-// fullName - имя и фамилия одной строкой.
+// fullName is first and last name in one string.
 func fullName(user *tg.User) string {
 	return strings.TrimSpace(user.FirstName + " " + user.LastName)
 }
 
-// runError гасит отмену контекста: остановка сервиса не является ошибкой.
+// runError swallows context cancellation: stopping the service is not an error.
 func runError(ctx context.Context, err error) error {
 	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 		return nil
@@ -688,7 +689,7 @@ func runError(ctx context.Context, err error) error {
 	return err
 }
 
-// resolver собирает диалер через SOCKS5 или nil для прямого соединения.
+// resolver builds a dialer over SOCKS5 or nil for a direct connection.
 func resolver(proxyURL string) (dcs.Resolver, error) {
 	if strings.TrimSpace(proxyURL) == "" {
 		return nil, nil
@@ -720,9 +721,9 @@ func resolver(proxyURL string) (dcs.Resolver, error) {
 	return dcs.Plain(dcs.PlainOptions{Dial: contextDialer.DialContext}), nil
 }
 
-// withDB открывает хранилище сессии. Права каталога проверяются, а не
-// выставляются молча: в этом файле лежит доступ к живому аккаунту, и открытый
-// каталог обязан останавливать старт, а не чиниться сам.
+// withDB opens the session storage. Directory permissions are checked, not set
+// silently: this file holds access to the live account, and an open directory
+// must stop the start, not fix itself.
 func withDB(path string, run func(*bolt.DB) error) (err error) {
 	dir := filepath.Dir(filepath.Clean(path))
 	if dir == "." || dir == string(filepath.Separator) {
@@ -741,8 +742,8 @@ func withDB(path string, run func(*bolt.DB) error) (err error) {
 
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
 	if err != nil {
-		// Файл держит один процесс: либо запущен отправщик, либо параллельно
-		// идёт вход. Без этой подсказки ошибка выглядит как «timeout».
+		// The file is held by one process: either the sender is running or a login
+		// is going on in parallel. Without this hint the error looks like "timeout".
 		if errors.Is(err, bolterr.ErrTimeout) {
 			return fmt.Errorf("telegram storage %q is locked by another process", path)
 		}
@@ -756,9 +757,9 @@ func withDB(path string, run func(*bolt.DB) error) (err error) {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return fmt.Errorf("protect telegram storage file: %w", err)
 	}
-	// Бакеты заводятся заранее: на пустом хранилище чтение отсутствующего
-	// бакета возвращает обычную ошибку вместо «сессии нет», и первый же вход
-	// падает с «bucket "session" does not exist».
+	// Buckets are created in advance: on an empty storage reading a missing
+	// bucket returns an ordinary error instead of "no session", and the very first login
+	// fails with "bucket "session" does not exist".
 	if err := db.Update(func(tx *bolt.Tx) error {
 		for _, bucket := range [][]byte{sessionBucket, peerBucket} {
 			if _, err := tx.CreateBucketIfNotExists(bucket); err != nil {
@@ -772,7 +773,7 @@ func withDB(path string, run func(*bolt.DB) error) (err error) {
 	return run(db)
 }
 
-// Self - аккаунт, которому принадлежит сессия.
+// Self is the account that owns the session.
 type Self struct {
 	ID       int64
 	Username string
@@ -780,12 +781,12 @@ type Self struct {
 	Phone    string
 }
 
-// Authorize проводит вход по коду из Telegram. Запускается один раз руками,
-// отдельной командой бинаря: сессия после этого живёт в StoragePath.
+// Authorize performs a login by a code from Telegram. It is run once by hand,
+// as a separate command of the binary: after that the session lives in StoragePath.
 //
-// Вернувшийся Self - не украшение отчёта. В хранилище может лежать сессия
-// прежнего аккаунта, и тогда вход пропускается молча: сверка номера ловит
-// случай, когда рассылка ушла бы не с того номера.
+// The returned Self is not a report decoration. The storage may hold the session
+// of a previous account, and then the login is skipped silently: the number check
+// catches the case where the campaign would go out from the wrong number.
 func Authorize(ctx context.Context, cfg Config) (Self, error) {
 	if err := cfg.validate(); err != nil {
 		return Self{}, err
@@ -825,8 +826,8 @@ func Authorize(ctx context.Context, cfg Config) (Self, error) {
 	return self, err
 }
 
-// samePhone сравнивает номера по цифрам: конфиг и Telegram пишут один и тот же
-// номер по-разному - с плюсом, со скобками, с пробелами.
+// samePhone compares numbers by digits: the config and Telegram write the same
+// number differently - with a plus, with parentheses, with spaces.
 func samePhone(a, b string) bool {
 	digits := func(phone string) string {
 		return strings.Map(func(r rune) rune {
@@ -840,9 +841,9 @@ func samePhone(a, b string) bool {
 	return left != "" && left == right
 }
 
-// authenticator отвечает на вопросы входа. Регистрация нового аккаунта и приём
-// условий не поддержаны намеренно: сервис работает существующим рабочим
-// аккаунтом, и молчаливое создание нового было бы худшим исходом из возможных.
+// authenticator answers the login questions. Registering a new account and
+// accepting the terms are deliberately not supported: the service works with an
+// existing working account, and silently creating a new one would be the worst possible outcome.
 type authenticator struct {
 	*terminal.Terminal
 	phone string

@@ -12,10 +12,9 @@ CREATE TABLE campaigns (
     ))
 );
 
--- Синглтон-паттерн: частичный уникальный индекс на постоянное значение
--- status ограничивает подходящие строки одной штукой, а не двумя частичный
--- предикатами по отдельному id. Гонка двух load_campaign разрешается на этом
--- индексе, а не в коде.
+-- Singleton pattern: a partial unique index on a constant status value
+-- limits matching rows to one, with no per-id predicates. A race between two
+-- load_campaign calls is resolved by this index, not in code.
 CREATE UNIQUE INDEX campaigns_one_active_idx ON campaigns (status) WHERE status = 'active';
 CREATE UNIQUE INDEX campaigns_one_draft_idx ON campaigns (status) WHERE status = 'draft';
 
@@ -29,8 +28,9 @@ CREATE TABLE accounts (
     CONSTRAINT accounts_daily_limit_check CHECK (daily_limit > 0)
 );
 
--- Строка аккаунта заводится один раз при первом старте процесса с данным
--- ACCOUNT_LABEL; уникальность метки не даёт второму контейнеру завести дубль.
+-- The account row is created once, when a process with a given ACCOUNT_LABEL
+-- starts for the first time; label uniqueness stops a second container from
+-- creating a duplicate.
 CREATE UNIQUE INDEX accounts_label_idx ON accounts (label);
 
 CREATE TABLE recipients (
@@ -52,8 +52,8 @@ CREATE TABLE recipients (
     ))
 );
 
--- Один контакт не встречается в одной кампании дважды: повторная пачка после
--- таймаута отсеивает дубль здесь, а не падает всей загрузкой.
+-- One contact appears at most once per campaign: a repeated batch after a
+-- timeout drops the duplicate here instead of failing the whole load.
 CREATE UNIQUE INDEX recipients_campaign_contact_idx ON recipients (campaign_id, amo_contact_id);
 
 CREATE TABLE stop_list (
@@ -63,8 +63,9 @@ CREATE TABLE stop_list (
     CONSTRAINT stop_list_identity_check CHECK (amo_contact_id IS NOT NULL OR username IS NOT NULL)
 );
 
--- Один и тот же контакт или ник не должен попадать в стоп-лист дважды: иначе
--- ручное ведение списка молча плодит дубли строк с одним и тем же смыслом.
+-- The same contact or username must not enter the stop list twice: otherwise
+-- manual upkeep of the list silently breeds duplicate rows with the same
+-- meaning.
 CREATE UNIQUE INDEX stop_list_contact_idx ON stop_list (amo_contact_id) WHERE amo_contact_id IS NOT NULL;
 CREATE UNIQUE INDEX stop_list_username_idx ON stop_list (username) WHERE username IS NOT NULL;
 

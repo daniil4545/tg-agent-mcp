@@ -1,8 +1,9 @@
 -- +goose Up
--- Замок и журнал вечерней сводки в одной строке. Отправщиков несколько, все
--- крутят один цикл на общей базе: без замка сводку отправил бы каждый.
--- Ключ - пара (день, адресат), а не день целиком: при частичном успехе повтор
--- обязан дослать только тем, кому не ушло, иначе первый получит сводку дважды.
+-- Lock and log of the evening digest in one row. There are several senders,
+-- all running the same loop on a shared database: without a lock each of them
+-- would send the digest. The key is the pair (day, recipient), not the day
+-- alone: after a partial success a retry must resend only to those who did not
+-- get it, otherwise the first recipient would receive the digest twice.
 CREATE TABLE daily_digest (
     id BIGSERIAL PRIMARY KEY,
     day DATE NOT NULL,

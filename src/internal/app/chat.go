@@ -14,37 +14,38 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/telegram"
 )
 
-// Chat - диалог: ручная переписка и чтение поверх той же сессии, что и
-// рассылка. Форма повторяет Sender - домен, граница наружу, метка аккаунта, -
-// потому что рубежи у них общие: тот же аккаунт, тот же дневной потолок, тот
-// же стоп.
+// Chat is the dialog: manual correspondence and reading over the same session
+// as the mailing. Its shape mirrors Sender - domain, outward boundary, account
+// label - because they share the gates: the same account, the same daily cap,
+// the same stop.
 type Chat struct {
 	service   *Service
 	transport Dialog
 	label     string
 }
 
-// NewChat собирает диалог на сервисе и транспорте.
+// NewChat builds a dialog on a service and a transport.
 func NewChat(service *Service, transport Dialog) *Chat {
 	return &Chat{service: service, transport: transport, label: service.cfg.AccountLabel}
 }
 
 const (
-	defaultHistory = 20  // сколько сообщений отдаётся без явной глубины
-	maxHistory     = 100 // потолок глубины: дальше ответ инструмента не читается
-	maxFound       = 20  // потолок находок поиска
-	// maxWait - потолок ожидания реплики. Держит его не сервис, а клиент MCP: у
-	// вызова инструмента свой потолок около минуты, и на живом контуре ожидания
-	// от 60 секунд падали у клиента по таймауту, не дождавшись нашего ответа.
-	// 45 секунд проверены и возвращаются целиком; дольше ждут повторным tg_read.
+	defaultHistory = 20  // how many messages are returned without an explicit depth
+	maxHistory     = 100 // depth cap: a longer tool answer is not readable
+	maxFound       = 20  // cap on search results
+	// maxWait is the cap on waiting for a reply. It is held not by the service
+	// but by the MCP client: a tool call has its own cap of about a minute, and
+	// on the live setup waits of 60 seconds or more timed out on the client side
+	// before our answer arrived. 45 seconds were tested and return in full; for
+	// a longer wait, repeat tg_read.
 	maxWait      = 45 * time.Second
-	pollInterval = 3 * time.Second // шаг опроса истории во время ожидания
-	maxTextLen   = 4096            // предел одного сообщения Telegram
-	stopTimeout  = 5 * time.Second // на запись стопа вне контекста запроса
+	pollInterval = 3 * time.Second // history polling step while waiting
+	maxTextLen   = 4096            // limit of one Telegram message
+	stopTimeout  = 5 * time.Second // to record a stop outside the request context
 )
 
-// Отказы рубежей ручной отправки. Список закрытый: новая строка здесь - новое
-// решение сервиса, а не новый текст в ответе агенту.
+// Refusals of the manual send gates. The list is closed: a new line here is a
+// new service decision, not new text in an answer to the agent.
 var (
 	ErrNoUsername      = errors.New("username is empty or does not look like a telegram username")
 	ErrEmptyText       = errors.New("message text is empty")
@@ -58,9 +59,10 @@ var (
 	ErrDirectPending   = errors.New("previous message to this person is in unknown state")
 )
 
-// pendingWait - отказ повтору поверх незакрытого касания вместе с остатком
-// срока. Срок несёт сама ошибка: считает его сервис по CLAIM_STALE_AFTER, а
-// текст ответа агенту про настройки не знает.
+// pendingWait refuses a repeat on top of an unclosed touch, together with the
+// time left. The error itself carries the period: the service computes it from
+// CLAIM_STALE_AFTER, and the text of the answer to the agent knows nothing about
+// settings.
 type pendingWait struct {
 	username string
 	left     time.Duration
@@ -72,13 +74,13 @@ func (e *pendingWait) Error() string {
 
 func (e *pendingWait) Unwrap() error { return ErrDirectPending }
 
-// campaignHold - кампания, чья строка держит человека закрытым для ручной
-// отправки. Id, название и статус несёт сама ошибка: снять блокировку можно
-// только действием над конкретной кампанией, и какое действие сработает,
-// решает её статус. queueOpensAt - когда очередь снова начнёт двигаться (ноль,
-// если она идёт прямо сейчас); staleAfter - за сколько протухает брошенный
-// claim. Оба нужны тексту отказа: без них совет «повторите через несколько
-// минут» врёт в ночь и в выходные.
+// campaignHold is a campaign whose row keeps a person closed to manual sending.
+// The error itself carries the id, title and status: the block can be lifted
+// only by an action on that specific campaign, and which action works is decided
+// by its status. queueOpensAt is when the queue starts moving again (zero if it
+// is moving right now); staleAfter is how long until an abandoned claim goes
+// stale. Both are needed by the refusal text: without them, the advice "try
+// again in a few minutes" is false at night and on weekends.
 type campaignHold struct {
 	username     string
 	id           int64
@@ -86,9 +88,10 @@ type campaignHold struct {
 	status       string
 	queueOpensAt time.Time
 	staleAfter   time.Duration
-	// broken - шаблон кампании не разобран, и очередь по ней стоит. Без этого
-	// признака совет «очередь закроет строку сама» врал бы: идущая кампания со
-	// сломанным шаблоном не отправит ничего, пока её не соберут заново.
+	// broken means the campaign template has unresolved braces and its queue is
+	// stalled. Without this flag the advice "the queue will close the row by
+	// itself" would be false: a running campaign with a broken template sends
+	// nothing until it is rebuilt.
 	broken bool
 }
 
@@ -98,14 +101,15 @@ func (e *campaignHold) Error() string {
 
 func (e *campaignHold) Unwrap() error { return ErrCampaignSending }
 
-// accountStop - стоп аккаунта с причиной. Причина едет вместе с ошибкой, потому
-// что от неё зависит следующий шаг человека: ограничение Telegram снимается
-// resume_account после проверки аккаунта, а отозванная сессия - повторным
-// входом, и перепутать эти два совета значит водить агента по кругу.
+// accountStop is an account stop with its reason. The reason travels with the
+// error because the person's next step depends on it: a Telegram restriction is
+// lifted by resume_account after checking the account, while a revoked session
+// needs a fresh login, and mixing up the two pieces of advice sends the agent
+// in circles.
 type accountStop struct {
 	reason string
-	// cause - отказ, из-за которого стоп поставлен сейчас; пусто, если стоп уже
-	// стоял в БД.
+	// cause is the failure that set the stop just now; empty if the stop was
+	// already in the database.
 	cause error
 }
 
@@ -118,8 +122,8 @@ func (e *accountStop) Error() string {
 
 func (e *accountStop) Unwrap() error { return ErrAccountStopped }
 
-// DirectSend - состоявшееся ручное касание. Cold называет цену: холодное
-// касание израсходовало дневной потолок аккаунта, тёплая реплика - нет.
+// DirectSend is a manual touch that took place. Cold names the cost: a cold
+// touch spent the account daily cap, a warm reply did not.
 type DirectSend struct {
 	ID       int64
 	Username string
@@ -127,24 +131,24 @@ type DirectSend struct {
 	Cold     bool
 }
 
-// Conversation - прочитанный диалог: история на момент запроса и отдельно то,
-// что пришло за время ожидания. Разделены, потому что ответ инструмента
-// называет их по-разному.
+// Conversation is a dialog that was read: the history at the time of the request
+// and, separately, what arrived while waiting. They are kept apart because the
+// tool answer names them differently.
 type Conversation struct {
 	Username string
 	UserID   int64
 	Messages []ChatMessage
-	// Fresh - входящие, дождавшиеся ответа; пусто, если ожидание истекло.
+	// Fresh holds the incoming messages that arrived while waiting; empty if the wait timed out.
 	Fresh  []ChatMessage
 	Waited time.Duration
 }
 
-// Find ищет человека по нику или имени. Наружу поиск не пишет и рубежами не
-// ограничен: allow-list держит отправку, а не чтение.
+// Find looks a person up by username or name. The search writes nothing outward
+// and is not limited by the gates: the allow-list covers sending, not reading.
 func (c *Chat) Find(ctx context.Context, query string) ([]Contact, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
-		return nil, errors.New("пустой запрос: назовите ник или имя")
+		return nil, errors.New("empty query: give a username or a name")
 	}
 	found, err := c.transport.Find(ctx, query, maxFound)
 	if err != nil {
@@ -156,13 +160,14 @@ func (c *Chat) Find(ctx context.Context, query string) ([]Contact, error) {
 	return found, nil
 }
 
-// Send пишет человеку руками. Рубежи те же, что у рассылки, кроме пауз: темп
-// задаёт человек. Окно и дневной потолок применяются только к первому касанию
-// незнакомца - реплика в идущем диалоге свободна в любое время, иначе запрет
-// ответить в 21:30 делает аккаунт менее похожим на живой, а не более.
+// Send writes to a person by hand. The gates are the same as for the mailing,
+// except pauses: the human sets the pace. The window and the daily cap apply
+// only to the first touch of a stranger - a reply in an ongoing dialog is free
+// at any time, otherwise a ban on answering at 21:30 makes the account look less
+// like a live one, not more.
 //
-// Строка журнала ложится до сетевого вызова: «Telegram подтвердил - процесс
-// умер - записи нет» оставило бы человека открытым для следующей кампании.
+// The journal row is written before the network call: "Telegram confirmed - the
+// process died - no record" would leave the person open to the next campaign.
 func (c *Chat) Send(ctx context.Context, username, text string) (DirectSend, error) {
 	name := normalizeUsername(username)
 	if name == "" {
@@ -175,8 +180,8 @@ func (c *Chat) Send(ctx context.Context, username, text string) (DirectSend, err
 		return DirectSend{}, c.refuse(name, fmt.Errorf("%w: %d symbols", ErrTextTooLong, length))
 	}
 
-	// Стоп аккаунта спрашивается дважды: здесь - чтобы не ходить в Telegram
-	// зря, и повторно под блокировкой строки, где решение и принимается.
+	// The account stop is checked twice: here, to avoid a pointless trip to
+	// Telegram, and again under the row lock, where the decision is made.
 	stopped, stopReason, err := c.service.AccountStopped(ctx, c.label)
 	if err != nil {
 		return DirectSend{}, err
@@ -194,8 +199,8 @@ func (c *Chat) Send(ctx context.Context, username, text string) (DirectSend, err
 		return DirectSend{}, c.refuse(name, fmt.Errorf("%w: @%s", ErrNotPrivate, name))
 	}
 
-	// Служебный адресат холодным не бывает: окно и потолок к нему не
-	// применяются, и читать историю ради ответа на этот вопрос незачем.
+	// A service recipient is never cold: the window and the cap do not apply to
+	// them, and there is no need to read the history to answer this question.
 	cold := false
 	if !c.service.isOwner(name) {
 		cold, err = c.coldContact(ctx, name, peer)
@@ -204,9 +209,9 @@ func (c *Chat) Send(ctx context.Context, username, text string) (DirectSend, err
 		}
 	}
 
-	// random_id свежий на каждый вызов, обратно кампании: диалог полон
-	// одинаковых реплик, и стабильный id заставил бы Telegram проглотить
-	// второе «ок» как дубль.
+	// random_id is fresh on every call, unlike the campaign: a dialog is full of
+	// identical replies, and a stable id would make Telegram swallow a second
+	// "ok" as a duplicate.
 	randomID := newRandomID()
 	id, err := c.openDirect(ctx, name, userID, text, randomID, cold)
 	if err != nil {
@@ -216,11 +221,12 @@ func (c *Chat) Send(ctx context.Context, username, text string) (DirectSend, err
 	messageID, sendErr := c.transport.Send(ctx, peer, text, randomID)
 	outcome := classifyDelivery(sendErr, c.service.cfg.FloodWaitThreshold)
 
-	// Единственный вопрос, на который отвечает исход: известно ли, что сообщения
-	// нет. Известно, когда отказал наш собственный рубеж - до сети дело не дошло,
-	// - и когда сервер разобрал запрос и выполнять его отказался. Неизвестно
-	// обратное: обрыв, таймаут и любой неопознанный отказ, а это прежде всего
-	// 5xx, после которого сообщение вполне может существовать.
+	// The only question the outcome answers: is it known that the message does
+	// not exist. It is known when our own gate refused - the network was never
+	// reached - and when the server parsed the request and refused to execute it.
+	// The opposite is unknown: a dropped connection, a timeout and any
+	// unrecognized failure, above all a 5xx, after which the message may well
+	// exist.
 	var failure *telegram.Failure
 	notCreated := errors.Is(sendErr, ErrNotAllowed) ||
 		(errors.As(sendErr, &failure) && failure.NotSent())
@@ -229,9 +235,10 @@ func (c *Chat) Send(ctx context.Context, username, text string) (DirectSend, err
 		if err := c.stopAccount(ctx, name, outcome.reason); err != nil {
 			return DirectSend{}, err
 		}
-		// Отказ, остановивший аккаунт, наружу идёт стопом: следующий шаг задаёт
-		// причина стопа, а не сам отказ. Совет «переждите до 14:20» увёл бы агента
-		// на второй круг: он подождёт, повторит и получит «аккаунт остановлен».
+		// A failure that stopped the account goes out as a stop: the next step is
+		// set by the stop reason, not by the failure itself. Advice like "wait
+		// until 14:20" would send the agent around again: it would wait, retry and
+		// get "account is stopped".
 		sendErr = &accountStop{reason: outcome.reason, cause: sendErr}
 	}
 
@@ -244,29 +251,30 @@ func (c *Chat) Send(ctx context.Context, username, text string) (DirectSend, err
 			"account", c.label, "username", name, "direct_id", id,
 			"user_id", userID, "cold", cold, "random_id", randomID, "message_id", messageID)
 		return DirectSend{ID: id, Username: name, UserID: userID, Cold: cold}, nil
-	// Сообщение заведомо не создано: строка уходит в failed, и человек снова
-	// доступен кампании. Ручной строке возвращаться в очередь некуда, а pending
-	// закрыл бы человека для всех кампаний навсегда. Стоп аккаунта по PEER_FLOOD
-	// и длинному FLOOD_WAIT стоит выше и от этой ветки не зависит: аккаунт
-	// останавливается, а касание закрывается - два следствия одного отказа.
+	// The message was certainly not created: the row goes to failed and the
+	// person is available to campaigns again. A manual row has no queue to
+	// return to, and pending would close the person to all campaigns forever.
+	// The account stop on PEER_FLOOD and a long FLOOD_WAIT sits above and does
+	// not depend on this branch: the account stops and the touch closes - two
+	// consequences of one failure.
 	case notCreated:
 		if err := c.closeDirect(ctx, id, name, "failed", outcome.reason, userID, 0); err != nil {
 			return DirectSend{}, err
 		}
 		slog.Warn("direct message undelivered", "username", name, "reason", outcome.reason)
 	default:
-		// Сообщение могло уйти: строка остаётся pending и закрывает человека.
-		// Безопасная сторона, и её цену показывает status.
+		// The message may have gone out: the row stays pending and closes the
+		// person. This is the safe side, and status shows its cost.
 		slog.Warn("direct message delivery unknown",
 			"username", name, "reason", outcome.reason, "direct_id", id)
 	}
 	return DirectSend{}, sendErr
 }
 
-// Read отдаёт диалог и, если попросили ждать, дожидается чужой реплики.
-// Ожидание - опрос истории, а не второй подписчик апдейтов: обработчик gotd
-// один на тип события и вызывается синхронно, поэтому заблокированный
-// подписчик остановил бы распознавание ответов кампании.
+// Read returns the dialog and, if asked to wait, waits for the other side's
+// reply. Waiting is history polling, not a second update subscriber: the gotd
+// handler is one per event type and is called synchronously, so a blocked
+// subscriber would stop campaign reply detection.
 func (c *Chat) Read(ctx context.Context, username string, depth int, waitFor time.Duration) (Conversation, error) {
 	name := normalizeUsername(username)
 	if name == "" {
@@ -289,9 +297,9 @@ func (c *Chat) Read(ctx context.Context, username string, depth int, waitFor tim
 		return talk, nil
 	}
 
-	// Ожидание кончает то из двух, что раньше: шаги опроса или часы сервиса.
-	// Шаги заканчивают его при неподвижных часах, часы - когда сам опрос
-	// оказался долгим и потолок ожидания иначе был бы превышен.
+	// The wait ends with whichever comes first: the polling steps or the service
+	// clock. The steps end it when the clock is frozen, the clock when the
+	// polling itself turned out slow and the wait cap would otherwise be exceeded.
 	deadline := c.service.Now().Add(waitFor)
 	last := lastMessageID(history)
 	waited := time.Duration(0)
@@ -319,8 +327,8 @@ func (c *Chat) Read(ctx context.Context, username string, depth int, waitFor tim
 	return talk, nil
 }
 
-// Dialogs отдаёт диалоги всех трёх видов - человека, группу, канал - в
-// порядке Telegram; вид каждой строки называет mcp.go по Ref и Broadcast.
+// Dialogs returns dialogs of all three kinds - person, group, channel - in
+// Telegram order; mcp.go names the kind of each row from Ref and Broadcast.
 func (c *Chat) Dialogs(ctx context.Context, limit int) ([]DialogInfo, error) {
 	limit = capped(limit, defaultHistory, maxHistory)
 	dialogs, err := c.transport.Dialogs(ctx, limit)
@@ -330,9 +338,9 @@ func (c *Chat) Dialogs(ctx context.Context, limit int) ([]DialogInfo, error) {
 	return dialogs, nil
 }
 
-// coldContact отвечает, холодное ли это касание. Строка журнала sent делает
-// проверку истории ненужной - этому человеку мы уже писали; иначе тёплым
-// считается собеседник, от которого есть хотя бы одно входящее.
+// coldContact answers whether this is a cold touch. A sent journal row makes the
+// history check unnecessary - we have already written to this person; otherwise
+// a correspondent with at least one incoming message counts as warm.
 func (c *Chat) coldContact(ctx context.Context, name string, peer Peer) (bool, error) {
 	var written bool
 	if err := c.service.pool.QueryRow(ctx,
@@ -355,10 +363,10 @@ func (c *Chat) coldContact(ctx context.Context, name string, peer Peer) (bool, e
 	return true, nil
 }
 
-// openDirect кладёт строку журнала под той же блокировкой строки аккаунта,
-// которую берёт ClaimNext: рубежи ручной отправки и рассылки решают про один
-// аккаунт, и решать их они обязаны по очереди. Порядок блокировок общий с
-// ClaimNext, и accounts у обеих первая - дедлока нет.
+// openDirect writes the journal row under the same account row lock that
+// ClaimNext takes: the manual-send and mailing gates decide about one account,
+// and they must decide in turn. The lock order is shared with ClaimNext, and
+// accounts comes first in both - there is no deadlock.
 func (c *Chat) openDirect(ctx context.Context, name string, userID int64, text string, randomID int64, cold bool) (int64, error) {
 	now := c.service.Now()
 	var id int64
@@ -388,9 +396,9 @@ func (c *Chat) openDirect(ctx context.Context, name string, userID int64, text s
 			return fmt.Errorf("%w: @%s", ErrStopList, name)
 		}
 
-		// Повтор поверх собственного незакрытого касания. Стоит до потолка: то
-		// же логическое касание не имеет права списать вторую единицу, а строка
-		// pending и так закрывает человека.
+		// A repeat on top of the caller's own unclosed touch. It stands before the
+		// cap: the same logical touch must not charge a second unit, and the
+		// pending row closes the person anyway.
 		var pendingAt time.Time
 		switch err := tx.QueryRow(ctx, directPendingSQL, name, c.service.staleBefore(now)).Scan(&pendingAt); {
 		case err == nil:
@@ -413,10 +421,10 @@ func (c *Chat) openDirect(ctx context.Context, name string, userID int64, text s
 			}
 		}
 
-		// Удержание на время идущей кампании служебного адресата не касается.
-		// Принятая цена - два сообщения подряд, ручное и кампанийное: для
-		// аккаунтов владельца это допустимо, для незнакомых людей удержание
-		// остаётся.
+		// The hold while a campaign is running does not apply to a service
+		// recipient. The accepted cost is two messages in a row, manual and
+		// campaign: that is acceptable for the owner's accounts, while for
+		// strangers the hold stays.
 		if !c.service.isOwner(name) {
 			hold := campaignHold{
 				username:     name,
@@ -435,8 +443,8 @@ func (c *Chat) openDirect(ctx context.Context, name string, userID int64, text s
 			}
 		}
 
-		// $2::bigint - явный тип: без приведения NULLIF выводит int4, и живой
-		// id Telegram больше 2^31 не кодируется вовсе.
+		// $2::bigint is an explicit type: without the cast NULLIF infers int4, and
+		// a real Telegram id above 2^31 cannot be encoded at all.
 		return tx.QueryRow(ctx,
 			`INSERT INTO direct_messages
 			 (username, tg_user_id, account_id, text, random_id, cold, state, created_at)
@@ -450,12 +458,13 @@ func (c *Chat) openDirect(ctx context.Context, name string, userID int64, text s
 	return id, nil
 }
 
-// closeDirect закрывает строку журнала по исходу отправки. failed тем же
-// заходом возвращает в очередь строки, снятые этим касанием: иначе человек не
-// получит ни ручного сообщения, ни кампанийного, а причина в отчёте соврёт.
-// message_id ложится только при успехе: нулевой id - это дубль по random_id,
-// Telegram второго сообщения не создал и называть его номер нечем. $6::bigint
-// приводится явно, как и tg_user_id: без приведения NULLIF выводит int4.
+// closeDirect closes the journal row by the send outcome. In the same pass,
+// failed returns to the queue the rows this touch had removed: otherwise the
+// person gets neither the manual message nor the campaign one, and the reason in
+// the report would be false. message_id is stored only on success: a zero id
+// means a duplicate by random_id, Telegram created no second message and there
+// is no number to give it. $6::bigint is cast explicitly, like tg_user_id:
+// without the cast NULLIF infers int4.
 func (c *Chat) closeDirect(ctx context.Context, id int64, name, state, reason string, userID int64, messageID int) error {
 	now := c.service.Now()
 	return db.InTx(ctx, c.service.pool, func(tx pgx.Tx) error {
@@ -479,13 +488,14 @@ func (c *Chat) closeDirect(ctx context.Context, id int64, name, state, reason st
 	})
 }
 
-// guard - ограничение аккаунта, каким бы вызовом оно ни пришло: резолвом,
-// чтением истории или самой отправкой. Ограничение принадлежит аккаунту, а не
-// методу (инвариант 3): contacts.resolveUsername отвечает FLOOD_WAIT раньше
-// отправки, и без этой ветки агент получал бы «переждите» и тратил на
-// ограниченном аккаунте ещё один резолв за повтор. Читающие инструменты идут
-// сюда же: сессия и лимиты у них общие с отправкой, а ложный стоп стоит одного
-// resume_account против цены аккаунта. Прочие отказы уходят наружу как есть.
+// guard handles an account restriction whatever call it came from: a resolve, a
+// history read or the send itself. The restriction belongs to the account, not
+// to the method (invariant 3): contacts.resolveUsername answers FLOOD_WAIT
+// before sending, and without this branch the agent would get "wait" and spend
+// one more resolve per retry on a restricted account. Reading tools come here
+// too: their session and limits are shared with sending, and a false stop costs
+// one resume_account against the price of the account. Other failures go out
+// as they are.
 func (c *Chat) guard(ctx context.Context, username string, err error) error {
 	if err == nil {
 		return nil
@@ -500,10 +510,11 @@ func (c *Chat) guard(ctx context.Context, username string, err error) error {
 	return &accountStop{reason: outcome.reason, cause: err}
 }
 
-// stopAccount фиксирует стоп: сначала лог, потом БД. Контекст свой, а не
-// контекст запроса: клиент MCP может оборвать вызов ровно на PEER_FLOOD, и
-// тогда стоп остался бы только в логе - ни в healthcheck, ни в рассылке его не
-// было бы. Активный стоп обязан быть виден снаружи, иначе его нет.
+// stopAccount records the stop: the log first, then the database. It uses its
+// own context, not the request context: the MCP client may drop the call right
+// at PEER_FLOOD, and then the stop would exist only in the log - neither the
+// healthcheck nor the mailing would see it. An active stop must be visible from
+// outside, otherwise it does not exist.
 func (c *Chat) stopAccount(ctx context.Context, username, reason string) error {
 	slog.Error("account stopped by telegram limit",
 		"account", c.label, "reason", reason, "username", username)
@@ -512,10 +523,10 @@ func (c *Chat) stopAccount(ctx context.Context, username, reason string) error {
 	return c.service.StopAccount(ctx, c.label, reason)
 }
 
-// nextWindow - когда очередь снова начнёт двигаться; ноль означает «идёт
-// сейчас». Нужен тексту отказа: строку, которую держит кампания, вне окна
-// отправки не сдвинет никто до ближайшего буднего утра, и совет «повторите
-// через несколько минут» в 21:30 бьёт агента в стену.
+// nextWindow returns when the queue starts moving again; zero means "moving
+// now". The refusal text needs it: a row held by a campaign outside the send
+// window will not be moved by anyone until the next weekday morning, and the
+// advice "try again in a few minutes" at 21:30 sends the agent into a wall.
 func (s *Service) nextWindow(now time.Time) time.Time {
 	if s.inSendWindow(now) {
 		return time.Time{}
@@ -532,16 +543,17 @@ func (s *Service) nextWindow(now time.Time) time.Time {
 	return open
 }
 
-// refuse называет отказ рубежа в логе: без этого отказ уходит только в текст
-// ответа агенту и исчезает вместе с диалогом.
+// refuse names a gate refusal in the log: without it the refusal goes only into
+// the answer text to the agent and disappears with the dialog.
 func (c *Chat) refuse(username string, err error) error {
 	slog.Warn("direct send refused", "account", c.label, "username", username, "error", err)
 	return err
 }
 
-// directTouched отвечает, писали ли этому человеку руками. Зовёт отправщик:
-// ответ в ручном диалоге строки кампании не имеет, и без этой проверки он
-// превратил бы WARN о несопоставленном входящем в фон.
+// directTouched answers whether this person was written to by hand. The sender
+// calls it: a reply in a manual dialog has no campaign row, and without this
+// check it would turn the WARN about an unmatched incoming message into
+// background noise.
 func (s *Service) directTouched(ctx context.Context, userID int64, username string) (bool, error) {
 	name := normalizeUsername(username)
 	if name == "" && userID <= 0 {
@@ -558,30 +570,32 @@ func (s *Service) directTouched(ctx context.Context, userID int64, username stri
 	return touched, nil
 }
 
-// Стоп-лист спрашивается по двум ключам, а не по одному: запись без ника
-// (только amo_contact_id) иначе не закрывает ручную отправку, а инвариант
-// «человек из стоп-листа не получает сообщение» сформулирован абсолютно. Ник
-// человека связывается с контактом через строки кампаний.
+// The stop list is queried by two keys, not one: an entry without a username
+// (only amo_contact_id) would otherwise not close manual sending, while the
+// invariant "a person on the stop list receives no message" is stated as
+// absolute. A person's username is linked to the contact through campaign rows.
 const directStopListSQL = `SELECT EXISTS (
 	SELECT 1 FROM stop_list s
 	WHERE s.username = $1
 	   OR EXISTS (SELECT 1 FROM recipients r
 	              WHERE r.username = $1 AND r.amo_contact_id = s.amo_contact_id))`
 
-// Гонка с рассылкой: строка этого человека уже побывала у отправщика, и её
-// доставка неизвестна. Признак попытки - account_id: его ставит только claim, и
-// строка остаётся за аккаунтом навсегда, тогда как claimed_at снимает возврат в
-// очередь после временного отказа ($2 - граница протухания).
+// A race with the mailing: this person's row has already been through the
+// sender, and its delivery is unknown. The sign of an attempt is account_id: only
+// claim sets it, and the row stays with the account forever, while claimed_at is
+// cleared by the return to the queue after a temporary failure ($2 is the
+// staleness bound).
 //
-// Блокируют только кампании, которые ещё могут отправить: в cancelled и done
-// очередь уже разобрана, снять такую строку человеку нечем, и блокировка была
-// бы вечной. Живой claim блокирует при любом статусе: отправщик несёт строку
-// прямо сейчас, и отмена кампании его не останавливает. Черновика в списке нет:
-// account_id ставит только claim, а claim идёт по активной кампании, и обратно в
-// draft статус не возвращается.
+// Only campaigns that can still send block: in cancelled and done the queue is
+// already cleared, there is nothing to release that row with, and the block
+// would be permanent. A live claim blocks under any status: the sender is
+// carrying the row right now, and cancelling the campaign does not stop it.
+// Draft is not in the list: only claim sets account_id, claim works on an active
+// campaign, and the status never goes back to draft.
 //
-// Отдаётся сама кампания со статусом, а не «да/нет»: отказ обязан назвать, кто
-// держит человека и что с этим делать, а действие у каждого статуса своё.
+// The campaign itself is returned with its status, not a yes/no: the refusal
+// must name who holds the person and what to do about it, and every status has
+// its own action.
 const campaignSendingSQL = `SELECT c.id, c.title, c.status, c.template_text
 	FROM recipients r
 	JOIN campaigns c ON c.id = r.campaign_id
@@ -590,16 +604,17 @@ const campaignSendingSQL = `SELECT c.id, c.title, c.status, c.template_text
 	ORDER BY r.id
 	LIMIT 1`
 
-// directPendingSQL - свежее незакрытое касание этому человеку ($2 - граница
-// протухания). Пока оно моложе границы, повтор отказывается: сообщение могло
-// уйти, и вторая строка списала бы за него ещё единицу дневного потолка.
+// directPendingSQL finds a fresh unclosed touch to this person ($2 is the
+// staleness bound). While it is younger than the bound, a repeat is refused: the
+// message may have gone out, and a second row would charge another unit of the
+// daily cap for it.
 const directPendingSQL = `SELECT created_at FROM direct_messages
 	WHERE username = $1 AND state = 'pending' AND created_at >= $2
 	ORDER BY id DESC LIMIT 1`
 
-// returnTouchedSQL возвращает в очередь строки, снятые этим ручным касанием:
-// отправка не состоялась, и человек снова доступен кампании. Закрытые кампании
-// не трогаются - их очередь уже разобрана.
+// returnTouchedSQL returns to the queue the rows this manual touch had removed:
+// the send did not happen, and the person is available to campaigns again.
+// Closed campaigns are not touched - their queue is already cleared.
 const returnTouchedSQL = `UPDATE recipients AS r
 	SET state = 'planned', reason = ''
 	FROM campaigns c
@@ -607,8 +622,8 @@ const returnTouchedSQL = `UPDATE recipients AS r
 	  AND r.username = $1 AND r.state = 'skipped'
 	  AND r.reason IN ('` + ReasonDirectSent + `', '` + ReasonDirectPending + `')`
 
-// privateUserID - рубеж «только личка»: ник канала резолвится так же успешно,
-// как ник человека. Пустая ссылка бывает у dry-run и отказом не является.
+// privateUserID is the "private chats only" gate: a channel username resolves as
+// successfully as a person's. An empty ref occurs in dry-run and is not a refusal.
 func privateUserID(ref telegram.Ref) (int64, bool) {
 	if ref == "" {
 		return 0, true
@@ -620,7 +635,7 @@ func privateUserID(ref telegram.Ref) (int64, bool) {
 	return id, true
 }
 
-// capped приводит запрошенный размер к границам; ноль означает «по умолчанию».
+// capped clamps the requested size to the bounds; zero means "default".
 func capped(value, fallback, limit int) int {
 	switch {
 	case value <= 0:
@@ -632,8 +647,8 @@ func capped(value, fallback, limit int) int {
 	}
 }
 
-// cappedWait приводит запрошенное ожидание к границам. Ноль означает «не
-// ждать»: инструмент чтения обязан отвечать сразу, если ждать не просили.
+// cappedWait clamps the requested wait to the bounds. Zero means "do not wait":
+// the read tool must answer immediately if no wait was requested.
 func cappedWait(pause time.Duration) time.Duration {
 	switch {
 	case pause <= 0:
@@ -655,8 +670,9 @@ func lastMessageID(history []ChatMessage) int {
 	return last
 }
 
-// newIncoming - чужие реплики новее последнего известного сообщения. Ждём
-// только входящее: своя отправка из соседнего вызова ответом не является.
+// newIncoming returns the other side's replies newer than the last known
+// message. We wait only for incoming ones: our own send from a neighboring call
+// is not a reply.
 func newIncoming(history []ChatMessage, lastID int) []ChatMessage {
 	var fresh []ChatMessage
 	for _, msg := range history {

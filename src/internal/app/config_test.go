@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-// resetLiveEnv гасит настройки боевого src/.env: Makefile подключает его и
-// экспортирует в окружение go test целиком, и живой транспорт с агентским
-// токеном валят конфигурацию своей причиной - тест падал бы на чужой
-// переменной, а не на своём предмете.
+// resetLiveEnv clears the settings of the live src/.env: the Makefile includes
+// it and exports it whole into the go test environment, and the live transport
+// with an agent token fails the configuration for its own reason - the test
+// would fail on a foreign variable instead of on its own subject.
 func resetLiveEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("TRANSPORT", "dry-run")
@@ -17,10 +17,10 @@ func resetLiveEnv(t *testing.T) {
 	t.Setenv("AGENT_ALLOW_LIST", "")
 }
 
-// DEV_ALLOW_LIST держит две разные роли, и разводит их контур: список служебных
-// адресатов владельца читается всегда, а рубежом транспорта остаётся только в
-// dev. В prod рассылка идёт живым людям, и рубеж списка не выпустил бы наружу
-// ни одного из них.
+// DEV_ALLOW_LIST holds two different roles, and the environment separates them:
+// the list of the owner's service recipients is always read, but it stays the
+// transport guard only in dev. In prod the campaign goes to real people, and
+// the list guard would let none of them out.
 func TestAllowListIsTransportLimitInDevOnly(t *testing.T) {
 	ctx := context.Background()
 	for _, env := range []string{"prod", "dev"} {
@@ -32,24 +32,24 @@ func TestAllowListIsTransportLimitInDevOnly(t *testing.T) {
 
 		cfg, err := LoadConfig()
 		if err != nil {
-			t.Fatalf("%s: конфигурация: %v", env, err)
+			t.Fatalf("%s: configuration: %v", env, err)
 		}
 		if len(cfg.OwnerAccounts) != 2 || cfg.OwnerAccounts[0] != "smirnov" {
-			t.Fatalf("%s: служебные адресаты %v", env, cfg.OwnerAccounts)
+			t.Fatalf("%s: service recipients %v", env, cfg.OwnerAccounts)
 		}
 
 		_, err = NewDryRunTransport(cfg).Resolve(ctx, "stranger_one")
 		if env == "prod" && err != nil {
-			t.Fatalf("prod: транспорт отказал постороннему: %v", err)
+			t.Fatalf("prod: transport refused an outsider: %v", err)
 		}
 		if env == "dev" && !errors.Is(err, ErrNotAllowed) {
-			t.Fatalf("dev: транспорт выпустил постороннего: err = %v", err)
+			t.Fatalf("dev: transport let an outsider out: err = %v", err)
 		}
 	}
 }
 
-// Ник уезжает в запросы SQL-литералом, поэтому его форму проверяет старт
-// процесса: кривая строка обязана не поднять сервис, а не оказаться в запросе.
+// The username goes into SQL queries as a literal, so process startup checks
+// its shape: a bad string must stop the service, not end up in a query.
 func TestAllowListRefusesBadUsername(t *testing.T) {
 	t.Setenv("ENV", "dev")
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
@@ -57,13 +57,13 @@ func TestAllowListRefusesBadUsername(t *testing.T) {
 	t.Setenv("DEV_ALLOW_LIST", "smirnov, o'brien")
 
 	if _, err := LoadConfig(); err == nil {
-		t.Fatal("конфигурация принята с ником не по форме")
+		t.Fatal("configuration accepted with a malformed username")
 	}
 }
 
-// Получатель сводки вне DEV_ALLOW_LIST обязан не поднять сервис: сводка уходит
-// после закрытия окна отправки, и для такого ника она стала бы холодным
-// касанием, то есть не дошла бы вовсе и молча.
+// A digest recipient outside DEV_ALLOW_LIST must stop the service: the digest
+// goes out after the send window closes, and for such a username it would be
+// a cold touch, that is, it would not arrive at all, and silently.
 func TestDigestToMustBeOwners(t *testing.T) {
 	t.Setenv("ENV", "dev")
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
@@ -74,33 +74,33 @@ func TestDigestToMustBeOwners(t *testing.T) {
 	t.Setenv("DIGEST_TO", "@Smirnov, manager_two")
 	cfg, err := LoadConfig()
 	if err != nil {
-		t.Fatalf("конфигурация с получателями из списка: %v", err)
+		t.Fatalf("configuration with recipients from the list: %v", err)
 	}
 	if len(cfg.DigestTo) != 2 || cfg.DigestTo[0] != "smirnov" {
-		t.Fatalf("получатели сводки %v", cfg.DigestTo)
+		t.Fatalf("digest recipients %v", cfg.DigestTo)
 	}
 
 	t.Setenv("DIGEST_TO", "smirnov, stranger_one")
 	if _, err := LoadConfig(); err == nil {
-		t.Fatal("конфигурация принята с получателем сводки вне DEV_ALLOW_LIST")
+		t.Fatal("configuration accepted with a digest recipient outside DEV_ALLOW_LIST")
 	}
 }
 
-// Агентский доступ либо настроен целиком, либо отсутствует: тихо неработающая
-// половина настройки или токен агента, совпавший с токеном владельца, обязаны
-// не поднять сервис.
+// Agent access is either configured whole or absent: a silently dead half of
+// the setting, or an agent token equal to the owner token, must stop the
+// service.
 func TestAgentAccessNeedsWholeSetting(t *testing.T) {
 	cases := []struct {
 		name, mcp, token, list string
 		ok                     bool
 	}{
-		{"не настроен", "true", "", "", true},
-		{"настроен", "true", "agent", "@dev_account", true},
-		{"токен без списка", "true", "agent", "", false},
-		{"список без токена", "true", "", "dev_account", false},
-		{"токен как у владельца", "true", "owner", "dev_account", false},
-		{"ник не по форме", "true", "agent", "dev_account, o'brien", false},
-		{"токен без MCP", "false", "agent", "dev_account", false},
+		{"not configured", "true", "", "", true},
+		{"configured", "true", "agent", "@dev_account", true},
+		{"token without list", "true", "agent", "", false},
+		{"list without token", "true", "", "dev_account", false},
+		{"token same as owner", "true", "owner", "dev_account", false},
+		{"malformed username", "true", "agent", "dev_account, o'brien", false},
+		{"token without MCP", "false", "agent", "dev_account", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -115,10 +115,10 @@ func TestAgentAccessNeedsWholeSetting(t *testing.T) {
 
 			cfg, err := LoadConfig()
 			if (err == nil) != tc.ok {
-				t.Fatalf("ждали принятие %v, ошибка %v", tc.ok, err)
+				t.Fatalf("expected acceptance %v, got error %v", tc.ok, err)
 			}
 			if tc.ok && tc.list != "" && (len(cfg.AgentAllowList) != 1 || cfg.AgentAllowList[0] != "dev_account") {
-				t.Fatalf("список агента %v", cfg.AgentAllowList)
+				t.Fatalf("agent list %v", cfg.AgentAllowList)
 			}
 		})
 	}

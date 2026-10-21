@@ -1,9 +1,9 @@
 -- +goose Up
--- Журнал ручных касаний: tg_send пишет незнакомым людям мимо очереди кампании,
--- и без учёта такой отправки завтрашняя кампания напишет человеку второй раз.
--- Строка ложится до сетевого вызова: «Telegram подтвердил - процесс умер -
--- записи нет» оставило бы человека незакрытым, а это прямое нарушение рубежа
--- «один человек - одно сообщение».
+-- Log of manual touches: tg_send writes to strangers outside the campaign
+-- queue, and without recording such a send tomorrow's campaign would message
+-- the person a second time. The row is written before the network call:
+-- "Telegram confirmed, the process died, no record" would leave the person
+-- unmarked, a direct breach of the "one person, one message" guard.
 CREATE TABLE direct_messages (
     id BIGSERIAL PRIMARY KEY,
     username TEXT NOT NULL,
@@ -20,17 +20,18 @@ CREATE TABLE direct_messages (
     CONSTRAINT direct_messages_state_check CHECK (state IN ('pending','sent','failed'))
 );
 
--- random_id свежий на каждый вызов, и уникальность его стережёт: диалог полон
--- одинаковых реплик, и повтор идентификатора заставил бы Telegram проглотить
--- второе сообщение как дубль.
+-- random_id is fresh on every call and uniqueness guards it: a dialog is full
+-- of identical replies, and a repeated identifier would make Telegram swallow
+-- the second message as a duplicate.
 CREATE UNIQUE INDEX direct_messages_random_id_idx ON direct_messages (random_id);
 
--- Отсев кампании спрашивает журнал по нику на каждой строке очереди; failed в
--- индекс не входит - сообщение заведомо не ушло, человек снова доступен.
+-- The campaign filter queries the log by username for every queue row; failed
+-- rows are left out of the index: the message certainly was not sent, so the
+-- person is available again.
 CREATE INDEX direct_messages_username_idx ON direct_messages (username) WHERE state <> 'failed';
 
--- Суточный счёт холодных касаний: первое касание незнакомца расходует тот же
--- дневной потолок аккаунта, что и рассылка.
+-- Daily count of cold touches: the first touch of a stranger spends the same
+-- daily cap of the account as a campaign does.
 CREATE INDEX direct_messages_cold_idx ON direct_messages (created_at) WHERE cold AND state <> 'failed';
 
 -- +goose Down

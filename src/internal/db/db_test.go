@@ -14,7 +14,7 @@ func newPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
 	if testing.Short() {
-		t.Skip("-short: интеграционный ярус пропущен")
+		t.Skip("-short: integration tier skipped")
 	}
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -37,8 +37,8 @@ func newPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// Ошибка внутри транзакции обязана откатывать всё: наполовину применённое
-// изменение хуже неприменённого, потому что выглядит успешным.
+// An error inside a transaction must roll everything back: a half-applied
+// change is worse than an unapplied one because it looks successful.
 func TestInTxRollsBackOnError(t *testing.T) {
 	pool := newPool(t)
 	ctx := context.Background()
@@ -51,7 +51,7 @@ func TestInTxRollsBackOnError(t *testing.T) {
 		return boom
 	})
 	if !errors.Is(err, boom) {
-		t.Fatalf("ошибка не вернулась вызывающему: %v", err)
+		t.Fatalf("error was not returned to the caller: %v", err)
 	}
 
 	var count int
@@ -59,7 +59,7 @@ func TestInTxRollsBackOnError(t *testing.T) {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 0 {
-		t.Fatalf("после отката осталось строк: %d", count)
+		t.Fatalf("rows left after rollback: %d", count)
 	}
 }
 
@@ -71,7 +71,7 @@ func TestInTxCommitsOnSuccess(t *testing.T) {
 		_, err := tx.Exec(ctx, "INSERT INTO tx_probe (id) VALUES (2)")
 		return err
 	}); err != nil {
-		t.Fatalf("транзакция: %v", err)
+		t.Fatalf("transaction: %v", err)
 	}
 
 	var count int
@@ -79,18 +79,18 @@ func TestInTxCommitsOnSuccess(t *testing.T) {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("после коммита строк %d, ожидалась одна", count)
+		t.Fatalf("rows after commit: %d, expected one", count)
 	}
 }
 
-// Пул, открытый на недоступную базу, обязан падать сразу: без пинга сервис
-// поднимается «здоровым» и разваливается на первом запросе.
+// A pool opened against an unreachable database must fail at once: without the
+// ping the service comes up "healthy" and breaks on the first query.
 func TestOpenFailsOnUnreachableDatabase(t *testing.T) {
 	if testing.Short() {
-		t.Skip("-short: интеграционный ярус пропущен")
+		t.Skip("-short: integration tier skipped")
 	}
 	_, err := Open(context.Background(), "postgres://nobody:nobody@127.0.0.1:1/none?sslmode=disable", 1)
 	if err == nil {
-		t.Fatal("пул открыт на недоступную базу")
+		t.Fatal("pool opened against an unreachable database")
 	}
 }

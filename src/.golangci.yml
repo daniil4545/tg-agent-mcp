@@ -1,15 +1,15 @@
 version: "2"
 
-# Набор по умолчанию плюс два исключения. Оба сознательные, а не обход красного:
-# QF-проверки staticcheck переписывают читаемый код в более короткий, но не более
-# понятный; непроверенный возврат в тестовых заглушках шумит и ничего не ловит.
+# The default set plus two exclusions. Both are deliberate, not a way around a
+# red build: staticcheck QF checks rewrite readable code into shorter but not
+# clearer code; an unchecked return in test stubs is noisy and catches nothing.
 linters:
   settings:
     staticcheck:
       checks:
         - all
-        # Набор ST по умолчанию выключен самим golangci-lint: это правила
-        # оформления комментариев и имён, они спорят с русскими комментариями.
+        # golangci-lint itself disables the ST set by default: these are rules
+        # for comment and name style, and this project does not enforce them.
         - -ST1000
         - -ST1003
         - -ST1016
@@ -17,8 +17,8 @@ linters:
         - -ST1021
         - -ST1022
         - -ST1023
-        - -QF1001 # закон де Моргана: явное отрицание пары читается лучше
-        - -QF1002 # switch с тегом: набор случаев здесь не по одному значению
+        - -QF1001 # De Morgan's law: an explicit negation of a pair reads better
+        - -QF1002 # tagged switch: the cases here are not on a single value
   exclusions:
     rules:
       - path: _test\.go

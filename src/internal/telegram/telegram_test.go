@@ -18,43 +18,43 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// Ссылка на адресата живёт в БД и в ключах очереди, поэтому у одного адресата
-// обязана быть ровно одна запись: иначе он получит два «первых» сообщения.
+// A recipient reference lives in the DB and in queue keys, so one recipient
+// must have exactly one form: otherwise they get two "first" messages.
 func TestRefRejectsNonCanonicalForms(t *testing.T) {
 	bad := []Ref{
-		"user:007",   // ведущие нули дали бы второй ключ тому же адресату
+		"user:007",   // leading zeros would give the same recipient a second key
 		"user:0",     //
 		"user:-1",    //
 		"user:",      //
 		"user",       //
-		"group:12",   // вида group у Telegram нет
+		"group:12",   // Telegram has no group kind
 		"USER:12",    //
-		"user:12:34", // хвост после id
+		"user:12:34", // tail after the id
 	}
 	for _, ref := range bad {
 		if _, _, err := ref.Split(); err == nil {
-			t.Errorf("ссылка %q принята", string(ref))
+			t.Errorf("reference %q accepted", string(ref))
 		}
 	}
 
 	kind, id, err := Ref("channel:1234567890").Split()
 	if err != nil || kind != KindChannel || id != 1234567890 {
-		t.Fatalf("разбор дал %v %d %v", kind, id, err)
+		t.Fatalf("parse gave %v %d %v", kind, id, err)
 	}
 	if got := NewRef(KindUser, 42); got != "user:42" {
-		t.Fatalf("сборка дала %q", string(got))
+		t.Fatalf("build gave %q", string(got))
 	}
 }
 
-// Групповой адресат там, где сервис ждёт человека, - ошибка данных, а не другой
-// сценарий: без этой проверки сообщение для одного человека уходит в чат.
+// A group recipient where the service expects a person is a data error, not
+// another scenario: without this check a message for one person goes to a chat.
 func TestUserIDRejectsGroups(t *testing.T) {
 	if _, err := Ref("user:42").UserID(); err != nil {
-		t.Fatalf("человек отвергнут: %v", err)
+		t.Fatalf("person rejected: %v", err)
 	}
 	for _, ref := range []Ref{"chat:42", "channel:42"} {
 		if _, err := ref.UserID(); err == nil {
-			t.Errorf("групповая ссылка %q принята как человек", string(ref))
+			t.Errorf("group reference %q accepted as a person", string(ref))
 		}
 	}
 }
@@ -67,26 +67,26 @@ func TestNormalizeKeepsGroupsAndDropsNoise(t *testing.T) {
 		peer    Ref
 	}{
 		{
-			name:    "личка с текстом",
-			message: &tg.Message{ID: 1, PeerID: &tg.PeerUser{UserID: 7}, Message: "привет"},
+			name:    "private chat with text",
+			message: &tg.Message{ID: 1, PeerID: &tg.PeerUser{UserID: 7}, Message: "hi"},
 			want:    true,
 			peer:    "user:7",
 		},
 		{
-			// Пакет один на все сервисы: тот, что читает каналы, обязан получать
-			// их сообщения, а отбор по виду адресата делает сервис.
-			name:    "канал с текстом",
-			message: &tg.Message{ID: 2, PeerID: &tg.PeerChannel{ChannelID: 9}, Message: "анонс"},
+			// One package for all services: the one that reads channels must receive
+			// their messages, and selection by recipient kind is done by the service.
+			name:    "channel with text",
+			message: &tg.Message{ID: 2, PeerID: &tg.PeerChannel{ChannelID: 9}, Message: "announcement"},
 			want:    true,
 			peer:    "channel:9",
 		},
 		{
-			name:    "служебное сообщение",
+			name:    "service message",
 			message: &tg.MessageService{ID: 3, PeerID: &tg.PeerUser{UserID: 7}},
 			want:    false,
 		},
 		{
-			name:    "пустое без вложения",
+			name:    "empty without attachment",
 			message: &tg.Message{ID: 4, PeerID: &tg.PeerUser{UserID: 7}, Message: "   "},
 			want:    false,
 		},
@@ -96,17 +96,17 @@ func TestNormalizeKeepsGroupsAndDropsNoise(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			msg, ok := normalize(&tg.UpdateNewMessage{Message: c.message}, tg.Entities{})
 			if ok != c.want {
-				t.Fatalf("разобрано=%v, ожидалось %v", ok, c.want)
+				t.Fatalf("parsed=%v, expected %v", ok, c.want)
 			}
 			if ok && msg.Peer != c.peer {
-				t.Fatalf("адресат %q, ожидался %q", string(msg.Peer), string(c.peer))
+				t.Fatalf("recipient %q, expected %q", string(msg.Peer), string(c.peer))
 			}
 		})
 	}
 }
 
-// Вложение без подписи - полноценное сообщение: голосовое и фото приходят без
-// единого символа текста, и молчаливый дроп терял бы их целиком.
+// An attachment without a caption is a full message: a voice message and a photo
+// arrive with no text at all, and a silent drop would lose them entirely.
 func TestNormalizeKeepsMediaWithoutCaption(t *testing.T) {
 	msg, ok := normalize(&tg.UpdateNewMessage{Message: &tg.Message{
 		ID:     5,
@@ -114,68 +114,68 @@ func TestNormalizeKeepsMediaWithoutCaption(t *testing.T) {
 		Media:  &tg.MessageMediaDocument{},
 	}}, tg.Entities{})
 	if !ok {
-		t.Fatal("вложение без подписи отброшено")
+		t.Fatal("attachment without a caption dropped")
 	}
 	if msg.MediaKind != "document" {
-		t.Fatalf("вид вложения %q", msg.MediaKind)
+		t.Fatalf("attachment kind %q", msg.MediaKind)
 	}
 
-	// Web-preview - оформление ссылки, а не вложение: считать его медиа значит
-	// уводить обычный текст в ветку разбора файлов.
+	// A web preview is the formatting of a link, not an attachment: treating it as
+	// media sends ordinary text into the file-parsing branch.
 	preview, ok := normalize(&tg.UpdateNewMessage{Message: &tg.Message{
 		ID:      6,
 		PeerID:  &tg.PeerUser{UserID: 7},
-		Message: "ссылка",
+		Message: "link",
 		Media:   &tg.MessageMediaWebPage{},
 	}}, tg.Entities{})
 	if !ok || preview.MediaKind != "" {
-		t.Fatalf("web-preview разобран как вложение: %q", preview.MediaKind)
+		t.Fatalf("web preview parsed as an attachment: %q", preview.MediaKind)
 	}
 }
 
-// В личке FromID пуст, и отправитель - сам собеседник. Без подстановки сервис
-// получил бы нулевого автора у каждого входящего.
+// In a private chat FromID is empty, and the sender is the counterpart
+// themselves. Without the substitution the service would get a zero author on every incoming message.
 func TestNormalizeFillsSenderInDirectMessages(t *testing.T) {
 	msg, ok := normalize(&tg.UpdateNewMessage{Message: &tg.Message{
-		ID: 7, PeerID: &tg.PeerUser{UserID: 77}, Message: "текст",
+		ID: 7, PeerID: &tg.PeerUser{UserID: 77}, Message: "text",
 	}}, tg.Entities{})
 	if !ok || msg.SenderID != 77 {
-		t.Fatalf("отправитель %d, ожидался 77", msg.SenderID)
+		t.Fatalf("sender %d, expected 77", msg.SenderID)
 	}
 
-	// В группе отправитель и адресат разные, и подменять один другим нельзя.
+	// In a group the sender and the recipient differ, and one must not be replaced by the other.
 	group, ok := normalize(&tg.UpdateNewMessage{Message: withFlags(&tg.Message{
 		ID: 8, PeerID: &tg.PeerChannel{ChannelID: 9},
-		FromID: &tg.PeerUser{UserID: 55}, Message: "текст",
+		FromID: &tg.PeerUser{UserID: 55}, Message: "text",
 	})}, tg.Entities{})
 	if !ok || group.SenderID != 55 {
-		t.Fatalf("отправитель в группе %d, ожидался 55", group.SenderID)
+		t.Fatalf("sender in group %d, expected 55", group.SenderID)
 	}
 }
 
-// withFlags проставляет битовую маску необязательных полей.
+// withFlags sets the bit mask of optional fields.
 //
-// В gotd опциональные поля и флаги-признаки читаются не из полей структуры, а
-// из Flags: GetOut возвращает Flags.Has(1), GetFromID проверяет Flags.Has(2).
-// При разборе с провода маску ставит декодер, а собранное в тесте сообщение
-// без SetFlags выглядит как входящее и без отправителя, что бы ни лежало в
-// полях. Тест, забывший этот вызов, зеленеет на сломанном коде.
+// In gotd optional fields and flag markers are read not from struct fields but
+// from Flags: GetOut returns Flags.Has(1), GetFromID checks Flags.Has(2).
+// When parsing from the wire the decoder sets the mask, and a message built in a
+// test without SetFlags looks incoming and without a sender, whatever lies in
+// the fields. A test that forgets this call goes green on broken code.
 func withFlags(message *tg.Message) *tg.Message {
 	message.SetFlags()
 	return message
 }
 
-// Своя реплика с того же аккаунта - не мусор: с рабочего номера пишет и человек
-// руками, и его сообщение сервису обычно важно.
+// Own reply from the same account is not junk: a person also writes by hand
+// from the work number, and their message is usually important to the service.
 func TestNormalizeMarksOutgoing(t *testing.T) {
 	msg, ok := normalize(&tg.UpdateNewMessage{Message: withFlags(&tg.Message{
-		ID: 9, Out: true, PeerID: &tg.PeerUser{UserID: 7}, Message: "ответ",
+		ID: 9, Out: true, PeerID: &tg.PeerUser{UserID: 7}, Message: "reply",
 	})}, tg.Entities{})
 	if !ok {
-		t.Fatal("исходящее отброшено")
+		t.Fatal("outgoing message dropped")
 	}
 	if !msg.Outgoing {
-		t.Fatal("исходящее не помечено")
+		t.Fatal("outgoing message not marked")
 	}
 }
 
@@ -187,36 +187,36 @@ func TestNormalizeTakesUsernameAndName(t *testing.T) {
 		}},
 	}}
 	msg, ok := normalize(&tg.UpdateNewMessage{Message: &tg.Message{
-		ID: 10, PeerID: &tg.PeerUser{UserID: 7}, Message: "текст",
+		ID: 10, PeerID: &tg.PeerUser{UserID: 7}, Message: "text",
 	}}, entities)
 	if !ok {
-		t.Fatal("сообщение отброшено")
+		t.Fatal("message dropped")
 	}
-	// Неактивный ник брать нельзя: он уже принадлежит кому-то другому.
+	// An inactive username must not be taken: it already belongs to somebody else.
 	if msg.Username != "ivan" {
-		t.Fatalf("ник %q", msg.Username)
+		t.Fatalf("username %q", msg.Username)
 	}
 	if msg.Name != "Иван Петров" {
-		t.Fatalf("имя %q", msg.Name)
+		t.Fatalf("name %q", msg.Name)
 	}
 }
 
-// Классификация решает, повторять или бросить. Ошибка в ней либо теряет
-// сообщение навсегда, либо крутит бесконечный повтор.
+// Classification decides whether to retry or give up. A mistake in it either
+// loses a message forever or spins an endless retry.
 func TestClassifySeparatesRetryFromPermanent(t *testing.T) {
 	flood := classify(tgerr.New(420, "FLOOD_WAIT_30"))
 	var failure *Failure
 	if !errors.As(flood, &failure) || failure.Kind != KindFloodWait {
-		t.Fatalf("flood wait разобран как %v", flood)
+		t.Fatalf("flood wait parsed as %v", flood)
 	}
 	if failure.Permanent {
-		t.Fatal("flood wait признан постоянным: сообщение потерялось бы")
+		t.Fatal("flood wait treated as permanent: the message would be lost")
 	}
 	if failure.RetryAt.IsZero() {
-		t.Fatal("срок повтора не взят из ошибки")
+		t.Fatal("retry time not taken from the error")
 	}
 	if wait := time.Until(failure.RetryAt); wait < 25*time.Second {
-		t.Fatalf("срок повтора %s, Telegram просил 30s", wait)
+		t.Fatalf("retry time %s, Telegram asked for 30s", wait)
 	}
 
 	permanentCases := map[string]string{
@@ -226,87 +226,87 @@ func TestClassifySeparatesRetryFromPermanent(t *testing.T) {
 		"AUTH_KEY_UNREGISTERED":      KindAuthForbidden,
 		"FROZEN_PARTICIPANT_MISSING": KindAuthForbidden,
 		"MEDIA_INVALID":              KindMediaInvalid,
-		// Отказы чтения: повтор той же просьбы даст тот же ответ, и временными
-		// их считать значит крутить его до исчерпания попыток.
+		// Read refusals: a retry of the same request gives the same answer, and
+		// treating them as temporary means spinning it until the attempts run out.
 		"MSG_ID_INVALID":         KindBadRequest,
 		"QUERY_TOO_SHORT":        KindBadRequest,
 		"SEARCH_QUERY_EMPTY":     KindBadRequest,
 		"OFFSET_PEER_ID_INVALID": KindBadRequest,
-		// Отвергнутый текст: сообщение заведомо не создано, а «повторим позже»
-		// оставляет строку журнала в pending навсегда и закрывает человека для
-		// всех кампаний без единой отправки.
+		// Rejected text: the message is certainly not created, while "retry later"
+		// leaves the journal row in pending forever and closes the person to
+		// all campaigns without a single send.
 		"MESSAGE_TOO_LONG": KindBadRequest,
 		"MESSAGE_EMPTY":    KindBadRequest,
 	}
 	for code, kind := range permanentCases {
 		err := classify(tgerr.New(400, code))
 		if !errors.As(err, &failure) || failure.Kind != kind || !failure.Permanent {
-			t.Errorf("%s разобран как %v", code, err)
+			t.Errorf("%s parsed as %v", code, err)
 		}
 	}
 
-	// Неизвестная ошибка обязана быть временной: брошенная навсегда, она тихо
-	// теряет сообщение, а лишний повтор стоит одной попытки.
+	// An unknown error must be temporary: abandoned forever, it silently
+	// loses a message, while an extra retry costs one attempt.
 	unknown := classify(tgerr.New(500, "SOMETHING_NEW"))
 	if !errors.As(unknown, &failure) || failure.Permanent {
-		t.Fatalf("неизвестная ошибка признана постоянной: %v", unknown)
+		t.Fatalf("unknown error treated as permanent: %v", unknown)
 	}
-	// 5xx с неизвестным кодом - единственный отказ, после которого доставка
-	// неизвестна: сервер мог создать сообщение и упасть уже потом. Код в Type от
-	// этого ничего не меняет, и «сообщения нет» здесь означало бы второе письмо.
+	// A 5xx with an unknown code is the only refusal after which delivery is
+	// unknown: the server may have created the message and failed afterwards. The
+	// code in Type changes nothing here, and "no message" would mean a second letter.
 	if failure.NotSent() {
-		t.Fatalf("5xx признан заведомо не отправленным: %v", unknown)
+		t.Fatalf("5xx treated as certainly not sent: %v", unknown)
 	}
-	// Без кода MTProto в тексте вызывающий видит «временная ошибка Telegram», из
-	// чего не следует ничего.
+	// Without the MTProto code in the text the caller sees "temporary Telegram
+	// error", which tells nothing.
 	if failure.Type != "SOMETHING_NEW" || !strings.Contains(unknown.Error(), "SOMETHING_NEW") {
-		t.Fatalf("код ошибки потерян: %q", unknown.Error())
+		t.Fatalf("error code lost: %q", unknown.Error())
 	}
 }
 
 func TestMediaInputDropsCaptionOnStickers(t *testing.T) {
-	_, caption, err := mediaInput("photo.jpg", "подпись")
-	if err != nil || caption != "подпись" {
-		t.Fatalf("фото: подпись %q, %v", caption, err)
+	_, caption, err := mediaInput("photo.jpg", "caption")
+	if err != nil || caption != "caption" {
+		t.Fatalf("photo: caption %q, %v", caption, err)
 	}
 
-	// Telegram показывает подпись к стикеру отдельным блоком, и лёгкое касание
-	// перестаёт быть лёгким.
-	_, caption, err = mediaInput("sticker.webm", "подпись")
+	// Telegram shows a sticker caption as a separate block, and a light touch
+	// stops being light.
+	_, caption, err = mediaInput("sticker.webm", "caption")
 	if err != nil || caption != "" {
-		t.Fatalf("стикер: подпись %q, %v", caption, err)
+		t.Fatalf("sticker: caption %q, %v", caption, err)
 	}
 
-	// Неизвестное расширение отсекается до загрузки файла и повтором не лечится.
+	// An unknown extension is rejected before the file upload and a retry does not cure it.
 	if _, _, err := mediaInput("archive.zip", ""); err == nil {
-		t.Fatal("неизвестное вложение принято")
+		t.Fatal("unknown attachment accepted")
 	} else if failure := new(Failure); !errors.As(err, &failure) || !failure.Permanent {
-		t.Fatalf("отказ по вложению не постоянный: %v", err)
+		t.Fatalf("attachment refusal is not permanent: %v", err)
 	}
 }
 
 func TestResolverAcceptsOnlySocks5(t *testing.T) {
 	if dialer, err := resolver(""); err != nil || dialer != nil {
-		t.Fatalf("пустой прокси дал %v, %v", dialer, err)
+		t.Fatalf("empty proxy gave %v, %v", dialer, err)
 	}
 	if _, err := resolver("socks5://10.0.0.1:20170"); err != nil {
-		t.Fatalf("socks5 отвергнут: %v", err)
+		t.Fatalf("socks5 rejected: %v", err)
 	}
 	for _, bad := range []string{"http://10.0.0.1:3128", "socks5://10.0.0.1", "socks5://10.0.0.1:20170/path", "10.0.0.1:20170"} {
 		if _, err := resolver(bad); err == nil {
-			t.Errorf("прокси %q принят", bad)
+			t.Errorf("proxy %q accepted", bad)
 		}
 	}
 }
 
-// Клиент, собранный на кривом конфиге, падал бы уже в проде при первой отправке.
+// A client built on a bad config would fail only in prod on the first send.
 func TestNewValidatesConfigAndHandler(t *testing.T) {
 	good := Config{AppID: 1, AppHash: "hash", Phone: "+70000000000", StoragePath: "/data/tg/session.bolt"}
 	if _, err := New(good, func(context.Context, Message) error { return nil }); err != nil {
-		t.Fatalf("верный конфиг отвергнут: %v", err)
+		t.Fatalf("valid config rejected: %v", err)
 	}
 	if _, err := New(good, nil); err == nil {
-		t.Fatal("клиент собран без обработчика: входящие уходили бы в никуда")
+		t.Fatal("client built without a handler: incoming messages would go nowhere")
 	}
 
 	bad := []Config{
@@ -318,37 +318,37 @@ func TestNewValidatesConfigAndHandler(t *testing.T) {
 	}
 	for i, cfg := range bad {
 		if _, err := New(cfg, func(context.Context, Message) error { return nil }); err == nil {
-			t.Errorf("конфиг %d принят", i)
+			t.Errorf("config %d accepted", i)
 		}
 	}
 }
 
-// Хранилище сессии - это доступ к живому аккаунту: открытый каталог обязан
-// останавливать старт, а не чиниться молча.
+// The session storage is access to the live account: an open directory must
+// stop the start, not fix itself silently.
 func TestWithDBRefusesLooseDirectories(t *testing.T) {
-	// t.TempDir отдаёт 0755, поэтому каталог сессии создаём сами: проверяется
-	// как раз строгость к правам.
+	// t.TempDir returns 0755, so the session directory is created here:
+	// the strictness about permissions is exactly what is checked.
 	dir := t.TempDir() + "/tg"
 	if err := withDB(dir+"/session.bolt", func(*bolt.DB) error { return nil }); err != nil {
-		t.Fatalf("выделенный каталог отвергнут: %v", err)
+		t.Fatalf("dedicated directory rejected: %v", err)
 	}
 
-	// Каталог верхнего уровня означает, что сессию положили рядом с чем попало.
+	// A top-level directory means the session was put next to whatever.
 	if err := withDB("session.bolt", func(*bolt.DB) error { return nil }); err == nil {
-		t.Fatal("сессия принята без выделенного каталога")
+		t.Fatal("session accepted without a dedicated directory")
 	}
 
 	loose := t.TempDir() + "/loose"
 	if err := os.MkdirAll(loose, 0o755); err != nil {
-		t.Fatalf("подготовка: %v", err)
+		t.Fatalf("setup: %v", err)
 	}
 	if err := withDB(loose+"/session.bolt", func(*bolt.DB) error { return nil }); err == nil {
-		t.Fatal("каталог с правами 0755 принят")
+		t.Fatal("directory with mode 0755 accepted")
 	}
 }
 
-// Сессия чужого аккаунта в хранилище означала бы рассылку не с того номера:
-// вход в этом случае пропускается молча, и ловит его только сверка номера.
+// A session of someone else's account in the storage would mean sending from the
+// wrong number: login is skipped silently in this case, and only the number check catches it.
 func TestSamePhoneComparesDigitsOnly(t *testing.T) {
 	same := [][2]string{
 		{"79001234567", "+7 900 123-45-67"},
@@ -356,7 +356,7 @@ func TestSamePhoneComparesDigitsOnly(t *testing.T) {
 	}
 	for _, pair := range same {
 		if !samePhone(pair[0], pair[1]) {
-			t.Errorf("номера %q и %q сочтены разными", pair[0], pair[1])
+			t.Errorf("numbers %q and %q considered different", pair[0], pair[1])
 		}
 	}
 
@@ -367,27 +367,27 @@ func TestSamePhoneComparesDigitsOnly(t *testing.T) {
 	}
 	for _, pair := range other {
 		if samePhone(pair[0], pair[1]) {
-			t.Errorf("номера %q и %q сочтены одним", pair[0], pair[1])
+			t.Errorf("numbers %q and %q considered the same", pair[0], pair[1])
 		}
 	}
 }
 
-// Поля сессии ставит и снимает горутина Run, а читают их обработчики MCP из
-// своих: без замка остановка сервиса посреди чтения даёт гонку и разыменование
-// nil - проверка `клиент запущен` прошла бы, а поле обнулилось следом.
+// The session fields are set and cleared by the Run goroutine and read by the
+// MCP handlers from their own: without the lock a service stop in the middle of a
+// read gives a race and a nil dereference - the `client started` check would pass and the field be zeroed right after.
 func TestSessionSurvivesConcurrentStop(t *testing.T) {
 	client, err := New(Config{AppID: 1, AppHash: "hash", Phone: "+70000000000", StoragePath: "/data/tg/session.bolt"},
 		func(context.Context, Message) error { return nil })
 	if err != nil {
-		t.Fatalf("подготовка: %v", err)
+		t.Fatalf("setup: %v", err)
 	}
 	api := tg.NewClient(stubInvoker{})
 	peers := &stubPeers{}
 
 	ctx := context.Background()
 	stop := make(chan struct{})
-	// Гонку ловит только перекрытие: без ожидания первого чтения горутина Run
-	// успевает поставить и снять сессию раньше, чем читатели проснутся.
+	// Only an overlap catches the race: without waiting for the first read, the
+	// Run goroutine sets and clears the session before the readers wake up.
 	started := make(chan struct{}, 4)
 	var readers sync.WaitGroup
 	for i := 0; i < 4; i++ {
@@ -423,12 +423,12 @@ func TestSessionSurvivesConcurrentStop(t *testing.T) {
 
 	var failure *Failure
 	if err := client.SetTyping(ctx, "user:7"); !errors.As(err, &failure) || failure.Kind != KindNotReady {
-		t.Fatalf("остановленный клиент ответил %v", err)
+		t.Fatalf("stopped client answered %v", err)
 	}
 }
 
-// Telegram отдаёт историю новыми сообщениями вперёд. Не развернув её, сервис
-// показал бы агенту диалог задом наперёд.
+// Telegram returns history with newest messages first. Without reversing it, the
+// service would show the agent the dialog backwards.
 func TestHistoryReturnsOldestFirst(t *testing.T) {
 	client := runningClient(t, stubInvoker{fill: func(_ bin.Encoder, output bin.Decoder) error {
 		box, ok := output.(*tg.MessagesMessagesBox)
@@ -437,9 +437,9 @@ func TestHistoryReturnsOldestFirst(t *testing.T) {
 		}
 		box.Messages = &tg.MessagesMessages{
 			Messages: []tg.MessageClass{
-				&tg.Message{ID: 3, PeerID: &tg.PeerUser{UserID: 7}, Message: "третье"},
+				&tg.Message{ID: 3, PeerID: &tg.PeerUser{UserID: 7}, Message: "third"},
 				&tg.MessageService{ID: 2, PeerID: &tg.PeerUser{UserID: 7}},
-				&tg.Message{ID: 1, PeerID: &tg.PeerUser{UserID: 7}, Message: "первое",
+				&tg.Message{ID: 1, PeerID: &tg.PeerUser{UserID: 7}, Message: "first",
 					Media: &tg.MessageMediaPhoto{}},
 			},
 			Users: []tg.UserClass{&tg.User{ID: 7, FirstName: "Иван", Username: "ivan"}},
@@ -449,20 +449,20 @@ func TestHistoryReturnsOldestFirst(t *testing.T) {
 
 	history, err := client.History(context.Background(), "user:7", 20, 0)
 	if err != nil {
-		t.Fatalf("история не прочитана: %v", err)
+		t.Fatalf("history not read: %v", err)
 	}
-	// Служебное сообщение выброшено, порядок от старых к новым.
+	// The service message is dropped, the order is from old to new.
 	if len(history) != 2 || history[0].ID != 1 || history[1].ID != 3 {
-		t.Fatalf("история %v", history)
+		t.Fatalf("history %v", history)
 	}
 	if history[0].MediaKind != "photo" || history[0].Username != "ivan" {
-		t.Fatalf("первое сообщение разобрано как %+v", history[0])
+		t.Fatalf("first message parsed as %+v", history[0])
 	}
 }
 
-// Список показывает все три вида адресата: у группы есть только название, у
-// канала ещё ник и флаг вещания, а его access hash оседает в хранилище - без
-// него приватная супергруппа стала бы нечитаемой навсегда.
+// The list shows all three recipient kinds: a group has only a title, a
+// channel also a username and the broadcast flag, and its access hash settles
+// in storage - without it a private supergroup would become unreadable forever.
 func TestDialogsTakeAllPeerKindsUpToLimit(t *testing.T) {
 	client := runningClient(t, stubInvoker{fill: func(_ bin.Encoder, output bin.Decoder) error {
 		box, ok := output.(*tg.MessagesDialogsBox)
@@ -477,10 +477,10 @@ func TestDialogsTakeAllPeerKindsUpToLimit(t *testing.T) {
 				&tg.Dialog{Peer: &tg.PeerUser{UserID: 8}, TopMessage: 6},
 			},
 			Messages: []tg.MessageClass{
-				&tg.Message{ID: 5, PeerID: &tg.PeerUser{UserID: 7}, Message: "привет"},
+				&tg.Message{ID: 5, PeerID: &tg.PeerUser{UserID: 7}, Message: "hi"},
 			},
 			Chats: []tg.ChatClass{
-				&tg.Chat{ID: 3, Title: "Галера"},
+				&tg.Chat{ID: 3, Title: "Клуб"},
 				&tg.Channel{ID: 5, AccessHash: 99, Title: "Анонсы", Username: "club_news", Broadcast: true},
 			},
 			Users: []tg.UserClass{&tg.User{ID: 7, FirstName: "Иван", Username: "ivan"}},
@@ -490,27 +490,27 @@ func TestDialogsTakeAllPeerKindsUpToLimit(t *testing.T) {
 
 	dialogs, err := client.Dialogs(context.Background(), 3)
 	if err != nil {
-		t.Fatalf("диалоги не прочитаны: %v", err)
+		t.Fatalf("dialogs not read: %v", err)
 	}
 	if len(dialogs) != 3 {
-		t.Fatalf("лимит не соблюдён: %d диалогов", len(dialogs))
+		t.Fatalf("limit not respected: %d dialogs", len(dialogs))
 	}
-	if got := dialogs[0]; got.Peer != "chat:3" || got.Name != "Галера" || got.Username != "" || got.Unread != 4 {
-		t.Fatalf("группа разобрана как %+v", got)
+	if got := dialogs[0]; got.Peer != "chat:3" || got.Name != "Клуб" || got.Username != "" || got.Unread != 4 {
+		t.Fatalf("group parsed as %+v", got)
 	}
 	if got := dialogs[1]; got.Peer != "channel:5" || got.Name != "Анонсы" || got.Username != "club_news" || !got.Broadcast {
-		t.Fatalf("канал разобран как %+v", got)
+		t.Fatalf("channel parsed as %+v", got)
 	}
-	if got := dialogs[2]; got.Peer != "user:7" || got.Unread != 2 || got.Username != "ivan" || got.Last.Text != "привет" {
-		t.Fatalf("личный диалог разобран как %+v", got)
+	if got := dialogs[2]; got.Peer != "user:7" || got.Unread != 2 || got.Username != "ivan" || got.Last.Text != "hi" {
+		t.Fatalf("private dialog parsed as %+v", got)
 	}
 	if peers, _ := client.peers.(*stubPeers); peers == nil || len(peers.channels) != 1 || peers.channels[0].AccessHash != 99 {
-		t.Fatalf("канал не попал в хранилище адресатов")
+		t.Fatalf("channel did not reach the recipient storage")
 	}
 }
 
-// Кэш access hash - побочная выгода списка: отказавший диск лишает следующий
-// срез хеша, но не отменяет уже разобранную выдачу.
+// Caching the access hash is a side benefit of the list: a failing disk deprives
+// the next slice of the hash but does not cancel the already parsed result.
 func TestDialogsSurviveStorageFailure(t *testing.T) {
 	client := runningClient(t, stubInvoker{fill: func(_ bin.Encoder, output bin.Decoder) error {
 		box, ok := output.(*tg.MessagesDialogsBox)
@@ -525,22 +525,22 @@ func TestDialogsSurviveStorageFailure(t *testing.T) {
 	}})
 	peers, _ := client.peers.(*stubPeers)
 	if peers == nil {
-		t.Fatal("подставное хранилище не поднялось")
+		t.Fatal("stub storage did not come up")
 	}
-	peers.failAdd = errors.New("диск полон")
+	peers.failAdd = errors.New("disk full")
 
 	dialogs, err := client.Dialogs(context.Background(), 5)
 	if err != nil {
-		t.Fatalf("отказ записи отменил выдачу: %v", err)
+		t.Fatalf("write failure cancelled the result: %v", err)
 	}
 	if len(dialogs) != 1 || dialogs[0].Peer != "channel:5" || dialogs[0].Name != "Анонсы" {
-		t.Fatalf("канал разобран как %+v", dialogs)
+		t.Fatalf("channel parsed as %+v", dialogs)
 	}
 }
 
-// Локальное хранилище отвечает без единого запроса к Telegram, поэтому идёт
-// первым; сервер добирает незнакомцев, и один человек не должен попасть в
-// ответ дважды.
+// Local storage answers without a single request to Telegram, so it goes first;
+// the server adds strangers, and one person must not appear in the
+// answer twice.
 func TestSearchUsersMergesLocalAndRemote(t *testing.T) {
 	client := runningClient(t, stubInvoker{fill: func(_ bin.Encoder, output bin.Decoder) error {
 		found, ok := output.(*tg.ContactsFound)
@@ -560,36 +560,36 @@ func TestSearchUsersMergesLocalAndRemote(t *testing.T) {
 
 	found, err := client.SearchUsers(context.Background(), "iva", 10)
 	if err != nil {
-		t.Fatalf("поиск не прошёл: %v", err)
+		t.Fatalf("search failed: %v", err)
 	}
 	if len(found) != 2 {
-		t.Fatalf("найдено %+v", found)
+		t.Fatalf("found %+v", found)
 	}
 	if found[0].Ref != "user:7" || !found[0].Known {
-		t.Fatalf("знакомый разобран как %+v", found[0])
+		t.Fatalf("acquaintance parsed as %+v", found[0])
 	}
-	// Незнакомца в хранилище нет: писать ему можно только после резолва ника.
+	// A stranger is not in storage: they can be written to only after resolving the username.
 	if found[1].Ref != "user:8" || found[1].Known {
-		t.Fatalf("незнакомец разобран как %+v", found[1])
+		t.Fatalf("stranger parsed as %+v", found[1])
 	}
 	if found[0].Exact || found[1].Exact {
-		t.Fatalf("похожие ники помечены точными: %+v", found)
+		t.Fatalf("similar usernames marked exact: %+v", found)
 	}
 
-	// Тот же запрос ником: локальная находка точная, похожий ник из
-	// contacts.search - нет.
+	// The same query by username: the local find is exact, the similar username from
+	// contacts.search is not.
 	found, err = client.SearchUsers(context.Background(), "ivan", 10)
 	if err != nil || len(found) != 2 {
-		t.Fatalf("поиск по нику дал %+v (%v)", found, err)
+		t.Fatalf("search by username gave %+v (%v)", found, err)
 	}
 	if !found[0].Exact || found[1].Exact {
-		t.Fatalf("точность локальной находки разобрана как %+v", found)
+		t.Fatalf("exactness of the local find parsed as %+v", found)
 	}
 }
 
-// Незнакомца по точному нику не отдаёт ни локальное хранилище, ни
-// contacts.search: без резолва tg_find отвечает «никого» о человеке, которому
-// tg_send написал бы.
+// A stranger by exact username is returned neither by local storage nor by
+// contacts.search: without the resolve tg_find answers "nobody" about a person
+// that tg_send would write to.
 func TestSearchUsersResolvesExactUsername(t *testing.T) {
 	client := runningClient(t, stubInvoker{fill: func(_ bin.Encoder, output bin.Decoder) error {
 		switch box := output.(type) {
@@ -608,15 +608,15 @@ func TestSearchUsersResolvesExactUsername(t *testing.T) {
 
 	found, err := client.SearchUsers(context.Background(), "@Petr_Ivanov", 10)
 	if err != nil {
-		t.Fatalf("поиск не прошёл: %v", err)
+		t.Fatalf("search failed: %v", err)
 	}
-	// Known false: адрес узнан этим же резолвом, знакомым человек от этого не
-	// стал - иначе отчёт обещал бы диалог, которого нет.
+	// Known false: the address was learned by this very resolve, and the person did not
+	// become an acquaintance because of it - otherwise the report would promise a dialog that does not exist.
 	if len(found) != 1 || found[0].Ref != "user:9" || found[0].Name != "Пётр" || found[0].Known || !found[0].Exact {
-		t.Fatalf("точный ник разобран как %+v", found)
+		t.Fatalf("exact username parsed as %+v", found)
 	}
 
-	// Неудачный резолв поиск не роняет: нечёткая часть отрабатывает как обычно.
+	// A failed resolve does not fail the search: the fuzzy part works as usual.
 	client = runningClient(t, stubInvoker{fill: func(_ bin.Encoder, output bin.Decoder) error {
 		box, ok := output.(*tg.ContactsFound)
 		if !ok {
@@ -630,19 +630,19 @@ func TestSearchUsersResolvesExactUsername(t *testing.T) {
 	}})
 	found, err = client.SearchUsers(context.Background(), "petr_ivano", 10)
 	if err != nil || len(found) != 1 || found[0].Exact {
-		t.Fatalf("после неудачного резолва поиск дал %+v (%v)", found, err)
+		t.Fatalf("after a failed resolve the search gave %+v (%v)", found, err)
 	}
 
-	// Тот же ответ на точный запрос: резолв не дошёл, а точность видна по нику из
+	// The same answer to an exact query: the resolve did not get through, and the exactness is visible from the username in
 	// contacts.search.
 	found, err = client.SearchUsers(context.Background(), "petr_ivanov", 10)
 	if err != nil || len(found) != 1 || !found[0].Exact {
-		t.Fatalf("точный ник из contacts.search разобран как %+v (%v)", found, err)
+		t.Fatalf("exact username from contacts.search parsed as %+v (%v)", found, err)
 	}
 
-	// Резолв сорван лимитом, а нечёткий поиск пуст: «никого не нашлось» здесь
-	// враньё - contacts.resolveUsername лимитирован на живом номере, и человек,
-	// которому tg_send напишет, существует. Наружу идёт причина срыва.
+	// The resolve is broken by a limit and the fuzzy search is empty: "nobody found" here
+	// is a lie - contacts.resolveUsername is limited on a live number, and the person
+	// that tg_send will write to exists. The reason for the failure goes out.
 	client = runningClient(t, stubInvoker{fill: func(_ bin.Encoder, output bin.Decoder) error {
 		box, ok := output.(*tg.ContactsFound)
 		if !ok {
@@ -654,13 +654,13 @@ func TestSearchUsersResolvesExactUsername(t *testing.T) {
 	found, err = client.SearchUsers(context.Background(), "petr_ivanov", 10)
 	var failure *Failure
 	if !errors.As(err, &failure) || failure.Kind != KindFloodWait || found != nil {
-		t.Fatalf("сорванный резолв отдал %+v (%v)", found, err)
+		t.Fatalf("failed resolve returned %+v (%v)", found, err)
 	}
 }
 
-// Человек сменил ник, в peer cache остался старый: локальный поиск по подстроке
-// находит его же, и резолв точного ника приходит на знакомый id. Отбросить
-// резолв целиком - ответить «точного ника нет» о том, кого искали.
+// A person changed the username, the peer cache kept the old one: the local substring search
+// finds the same person, and the exact-username resolve arrives on a known id. Dropping the
+// resolve entirely would answer "no exact username" about the one we searched for.
 func TestSearchUsersMarksExactOnRenamedPeer(t *testing.T) {
 	client := runningClient(t, stubInvoker{fill: func(_ bin.Encoder, output bin.Decoder) error {
 		switch box := output.(type) {
@@ -679,20 +679,20 @@ func TestSearchUsersMarksExactOnRenamedPeer(t *testing.T) {
 
 	found, err := client.SearchUsers(context.Background(), "petr_ivanov", 10)
 	if err != nil {
-		t.Fatalf("поиск не прошёл: %v", err)
+		t.Fatalf("search failed: %v", err)
 	}
 	if len(found) != 1 || !found[0].Exact || found[0].Username != "petr_ivanov" {
-		t.Fatalf("сменивший ник разобран как %+v", found)
+		t.Fatalf("person who changed username parsed as %+v", found)
 	}
 }
 
-// Клиент без сессии обязан отвечать отказом, а не падать: обработчик MCP может
-// прийти раньше, чем поднимется Run.
+// A client without a session must answer with a refusal, not crash: an MCP
+// handler can arrive before Run comes up.
 func TestDialogToolsRefuseWithoutSession(t *testing.T) {
 	client, err := New(Config{AppID: 1, AppHash: "hash", Phone: "+70000000000", StoragePath: "/data/tg/session.bolt"},
 		func(context.Context, Message) error { return nil })
 	if err != nil {
-		t.Fatalf("подготовка: %v", err)
+		t.Fatalf("setup: %v", err)
 	}
 	ctx := context.Background()
 	calls := map[string]error{}
@@ -703,26 +703,26 @@ func TestDialogToolsRefuseWithoutSession(t *testing.T) {
 	var failure *Failure
 	for name, err := range calls {
 		if !errors.As(err, &failure) || failure.Kind != KindNotReady {
-			t.Errorf("%s без сессии ответил %v", name, err)
+			t.Errorf("%s without a session answered %v", name, err)
 		}
 	}
 }
 
-// runningClient - клиент с поднятой подставной сессией: тесты пакета в сеть не
-// ходят, ответы Telegram собирает stubInvoker.
+// runningClient is a client with a stub session brought up: the package tests do
+// not go to the network, Telegram's answers are assembled by stubInvoker.
 func runningClient(t *testing.T, invoker stubInvoker, known ...*tg.User) *Client {
 	t.Helper()
 	client, err := New(Config{AppID: 1, AppHash: "hash", Phone: "+70000000000", StoragePath: "/data/tg/session.bolt"},
 		func(context.Context, Message) error { return nil })
 	if err != nil {
-		t.Fatalf("подготовка: %v", err)
+		t.Fatalf("setup: %v", err)
 	}
 	client.setSession(tg.NewClient(invoker), &stubPeers{users: known})
 	return client
 }
 
-// stubInvoker подменяет RPC: ответ пишется прямо в бокс результата, как это
-// делает декодер провода.
+// stubInvoker replaces RPC: the answer is written straight into the result box,
+// as the wire decoder does.
 type stubInvoker struct {
 	fill func(input bin.Encoder, output bin.Decoder) error
 }
@@ -734,20 +734,20 @@ func (s stubInvoker) Invoke(_ context.Context, input bin.Encoder, output bin.Dec
 	return s.fill(input, output)
 }
 
-// stubPeers - хранилище адресатов в памяти. Замок нужен ради теста гонки: там
-// в него пишут и читают четыре горутины разом.
+// stubPeers is a recipient storage in memory. The lock is needed for the race
+// test: four goroutines write and read it at once there.
 type stubPeers struct {
 	mu       sync.Mutex
 	users    []*tg.User
 	channels []*tg.Channel
-	// failAdd - отказ записи: полный диск или недоступный bolt.
+	// failAdd is a write failure: a full disk or an unavailable bolt.
 	failAdd error
 }
 
-// Add запоминает адресата по-настоящему: на этом стоит поиск точного ника -
-// ResolveUsername кладёт человека сюда, а имя читается отсюда же. Запись по id
-// замещающая для обоих видов, как в боевом хранилище: сменивший ник человек и
-// повторно увиденный в списке канал не должны лежать там дважды.
+// Add remembers the recipient for real: the exact-username search stands on it -
+// ResolveUsername puts the person here, and the name is read from here too. A
+// write by id replaces for both kinds, as in the live storage: a person who
+// changed username and a channel seen again in the list must not lie there twice.
 func (s *stubPeers) Add(_ context.Context, peer storage.Peer) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -772,9 +772,9 @@ func (s *stubPeers) Add(_ context.Context, peer storage.Peer) error {
 		}
 		s.channels = append(s.channels, peer.Channel)
 	default:
-		// FromChat на ChatForbidden/ChannelForbidden кладёт ключ без сущности:
-		// подставка такое не хранит и говорит об этом, а не роняет обход nil-ом.
-		return fmt.Errorf("stub peers: адресат %v без user и channel", peer.Key)
+		// FromChat on ChatForbidden/ChannelForbidden puts a key without an entity:
+		// the stub does not store that and says so, instead of crashing the walk with nil.
+		return fmt.Errorf("stub peers: recipient %v without user and channel", peer.Key)
 	}
 	return nil
 }
@@ -818,34 +818,34 @@ func (s *stubPeerIterator) Value() storage.Peer {
 	return storage.Peer{Key: dialogs.DialogKey{ID: user.ID}, User: user}
 }
 
-// Блок в тройных кавычках уходит сущностью pre со смещением в единицах UTF-16:
-// кириллица - одна единица, эмодзи - две. Без пары границ текст не трогается.
+// A block in triple quotes goes out as a pre entity with an offset in UTF-16 units:
+// Cyrillic is one unit, an emoji is two. Without a pair of delimiters the text is untouched.
 func TestSplitPre(t *testing.T) {
 	cases := []struct {
 		name, text, want string
 		offset, length   int
 		entity           bool
 	}{
-		{"таблица", "Итог 😀:\n```\nа б\nв г\n```", "Итог 😀:\nа б\nв г", 9, 7, true},
-		{"текст после блока", "```\nx\n```\nконец", "x\nконец", 0, 1, true},
-		{"без закрытия", "```\nx", "```\nx", 0, 0, false},
-		{"без блока", "привет", "привет", 0, 0, false},
+		{"table", "Итог 😀:\n```\nа б\nв г\n```", "Итог 😀:\nа б\nв г", 9, 7, true},
+		{"text after block", "```\nx\n```\nend", "x\nend", 0, 1, true},
+		{"no closing", "```\nx", "```\nx", 0, 0, false},
+		{"no block", "hi", "hi", 0, 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got, entities := splitPre(c.text)
 			if got != c.want {
-				t.Fatalf("текст %q, ожидали %q", got, c.want)
+				t.Fatalf("text %q, expected %q", got, c.want)
 			}
 			if !c.entity {
 				if len(entities) != 0 {
-					t.Fatalf("лишняя разметка: %v", entities)
+					t.Fatalf("extra markup: %v", entities)
 				}
 				return
 			}
 			pre, ok := entities[0].(*tg.MessageEntityPre)
 			if len(entities) != 1 || !ok || pre.Offset != c.offset || pre.Length != c.length {
-				t.Fatalf("разметка %v, ожидали pre %d+%d", entities, c.offset, c.length)
+				t.Fatalf("markup %v, expected pre %d+%d", entities, c.offset, c.length)
 			}
 		})
 	}

@@ -14,58 +14,58 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/telegram"
 )
 
-// Sender - демон отправки. Один цикл на процесс и один аккаунт (ACCOUNT_LABEL):
-// пула горутин нет намеренно, темп рассылки держится паузами, а не
-// параллельностью, и второй аккаунт - это второй контейнер.
+// Sender is the sending daemon. One loop per process and one account (ACCOUNT_LABEL):
+// there is deliberately no goroutine pool, the campaign pace is held by pauses,
+// not by parallelism, and a second account is a second container.
 type Sender struct {
 	service   *Service
 	transport Transport
 	label     string
 
-	// chat - путь прямой отправки для вечерней сводки. Своего пути у сводки
-	// нет: Chat.Send уже держит стоп аккаунта, резолв пира и журнал касаний.
-	// Пусто - сводки нет вовсе.
+	// chat is the direct-send path for the evening digest. The digest has no path
+	// of its own: Chat.Send already holds the account stop, peer resolution and
+	// the touch journal. Empty means no digest at all.
 	chat *Chat
 
-	// lastIdle - причина простоя, о которой уже сказано в логе. Без этой памяти
-	// закрытое окно писало бы одну и ту же строку каждый виток всю ночь.
+	// lastIdle is the idle reason already reported in the log. Without this memory
+	// a closed window would write the same line every iteration all night.
 	lastIdle string
 }
 
-// UseChat подключает диалог, которым уходит вечерняя сводка. Отдельным методом,
-// а не аргументом конструктора: Chat строится на том же транспорте позже, уже
-// после того как отправщик отдан в колбэк входящих сообщений.
+// UseChat attaches the dialog that carries the evening digest. A separate
+// method, not a constructor argument: Chat is built on the same transport later,
+// after the sender has already been handed to the incoming-message callback.
 func (s *Sender) UseChat(chat *Chat) { s.chat = chat }
 
-// idleUnavailable - место причины, когда её не удалось прочитать. Значение
-// заведомо не совпадает с настоящими причинами: иначе вернувшаяся БД молчала
-// бы про состояние очереди.
+// idleUnavailable stands in for the reason when it could not be read. The value
+// deliberately differs from the real reasons: otherwise a returning database
+// would stay silent about the queue state.
 const idleUnavailable = "idle_reason_unavailable"
 
-// NewSender собирает отправщика на сервисе и транспорте.
+// NewSender builds a sender on a service and a transport.
 func NewSender(service *Service, transport Transport) *Sender {
 	return &Sender{service: service, transport: transport, label: service.cfg.AccountLabel}
 }
 
-// Run держит цикл до остановки контекста. Состояния в памяти нет: каждый виток
-// заново спрашивает БД, поэтому перезапуск продолжает кампанию с места.
-// Строку аккаунта заводит старт процесса (cmd), а не цикл: healthcheck
-// спрашивает её раньше, чем отправщик успевает подняться.
+// Run holds the loop until the context is stopped. There is no in-memory state:
+// each iteration asks the database again, so a restart resumes the campaign in
+// place. The account row is created by process startup (cmd), not by the loop:
+// the healthcheck asks for it before the sender manages to come up.
 func (s *Sender) Run(ctx context.Context) error {
 	slog.Info("sender started", "account", s.label)
 
 	for {
 		if err := s.step(ctx); err != nil {
-			// Остановка сервиса ошибкой не является: незакрытая строка
-			// протухнет по claim и вернётся в очередь.
+			// Stopping the service is not an error: an unclosed row
+			// goes stale by claim and returns to the queue.
 			if ctx.Err() != nil {
 				return nil
 			}
 			return err
 		}
-		// Сводка зовётся здесь, а не в хвосте step: вечером очередь пуста, и
-		// step в этой ветке возвращается раньше. Её ошибка цикл не
-		// останавливает - рассылка писем важнее отчёта о ней.
+		// The digest is called here, not at the tail of step: in the evening the queue
+		// is empty and step returns earlier on that branch. Its error does not stop
+		// the loop - sending the messages matters more than the report about them.
 		if err := s.maybeSendDigest(ctx); err != nil && ctx.Err() == nil {
 			slog.Warn("digest failed", "error", err)
 		}
@@ -75,9 +75,9 @@ func (s *Sender) Run(ctx context.Context) error {
 	}
 }
 
-// step - один виток: взять строку и доставить её. Рубежи (окно, потолок, стоп
-// аккаунта, стоп-лист) стоят внутри ClaimNext - пустой ответ означает, что
-// отправлять сейчас нечего или нельзя.
+// step is one iteration: take a row and deliver it. The guards (window, cap,
+// account stop, stop list) sit inside ClaimNext - an empty answer means there
+// is nothing to send now or it is not allowed.
 func (s *Sender) step(ctx context.Context) error {
 	item, err := s.service.ClaimNext(ctx, s.label)
 	if err != nil {
@@ -98,32 +98,32 @@ func (s *Sender) step(ctx context.Context) error {
 	return s.SendClaimed(ctx, item)
 }
 
-// SendClaimed доставляет взятую строку и закрывает её по исходу. Сетевые вызовы
-// идут вне транзакций: claim уже закоммичен, финализация - отдельная короткая
-// транзакция после ответа Telegram.
+// SendClaimed delivers a claimed row and closes it by outcome. Network calls
+// run outside transactions: the claim is already committed, and finalization is
+// a separate short transaction after Telegram's answer.
 func (s *Sender) SendClaimed(ctx context.Context, item *Recipient) error {
 	peer, err := s.transport.Resolve(ctx, item.Username)
 	if err == nil {
-		// Id человека переживает резолв в БД: короткое входящее ника не несёт,
-		// и без id ответ такого человека своей строки не найдёт.
+		// The person's id survives resolution into the DB: a short incoming update
+		// carries no username, and without the id this person's reply would not find its row.
 		if userID, refErr := peer.Ref.UserID(); refErr == nil {
 			item.UserID = userID
 		}
-		// Id сообщения кампании не нужен: строка получателя опознаётся по
-		// random_id, а журнал id ведёт только ручное касание.
+		// The campaign does not need the message id: the recipient row is identified by
+		// random_id, and only the manual touch keeps an id journal.
 		_, err = s.transport.Send(ctx, peer, item.Text, item.RandomID)
 	}
 
 	outcome := classifyDelivery(err, s.service.cfg.FloodWaitThreshold)
 	switch {
 	case outcome.stop:
-		// Активный стоп обязан быть виден снаружи: рубеж, о котором никто не
-		// узнал, равен его отсутствию.
+		// An active stop must be visible from outside: a guard nobody
+		// learned about equals no guard.
 		slog.Error("account stopped by telegram limit",
 			"account", s.label, "reason", outcome.reason, "username", item.Username)
 	case outcome.result == ResultSent:
-		// След доставки: без него разбор «почему письмо не ушло вовремя» идёт
-		// по базе, а лог показывает только неудачи.
+		// Delivery trail: without it the analysis of "why the message did not go out on
+		// time" goes through the database, and the log shows only failures.
 		slog.Info("message sent",
 			"account", s.label, "username", item.Username, "recipient_id", item.ID,
 			"campaign_id", item.CampaignID, "user_id", item.UserID, "random_id", item.RandomID)
@@ -133,9 +133,9 @@ func (s *Sender) SendClaimed(ctx context.Context, item *Recipient) error {
 		slog.Warn("delivery postponed", "username", item.Username, "reason", outcome.reason)
 	}
 
-	// Стоп аккаунта пишется первым: рубеж не должен зависеть от того, удалась ли
-	// вторая запись. Упавшая финализация оставит строку под протухающим claim,
-	// а незаписанный стоп оставил бы аккаунт под ограничением в рассылке.
+	// The account stop is written first: the guard must not depend on whether the
+	// second write succeeded. A failed finalization leaves the row under a
+	// going-stale claim, while an unwritten stop would leave the account under a Telegram restriction in the campaign.
 	if outcome.stop {
 		if err := s.service.StopAccount(ctx, s.label, outcome.reason); err != nil {
 			return err
@@ -145,10 +145,10 @@ func (s *Sender) SendClaimed(ctx context.Context, item *Recipient) error {
 	if err != nil {
 		return err
 	}
-	// Доставка состоялась, а записать её некуда. Строка уже sent - значит её
-	// закрыл другой процесс той же метки, перехвативший протухший claim: факт
-	// доставки в БД стоит, тревожить некому. Всё остальное - настоящее
-	// расхождение, и единственный его след - этот лог.
+	// The delivery happened but there is nowhere to record it. If the row is
+	// already sent, another process with the same label closed it after taking
+	// over a stale claim: the delivery fact is in the DB, nobody to alert. Anything
+	// else is a real divergence, and this log line is its only trace.
 	if !closed && outcome.result == ResultSent {
 		var state string
 		readErr := s.service.pool.QueryRow(ctx,
@@ -167,17 +167,18 @@ func (s *Sender) SendClaimed(ctx context.Context, item *Recipient) error {
 	return nil
 }
 
-// OnMessage - точка подключения к живому транспорту: telegram.Client отдаёт
-// сюда нормализованное входящее (сигнатура telegram.Handler). Сама связка с
-// диспетчером gotd в срез не входит и впервые исполняется живьём на пилоте.
+// OnMessage is the connection point to the live transport: telegram.Client
+// hands the normalized incoming message here (signature telegram.Handler). The
+// link with the gotd dispatcher itself is not part of the slice and runs live
+// for the first time in the pilot.
 //
-// Личное сообщение от человека закрывает его строку: отправленную переводит в
-// replied, ещё не отправленную - тоже, и приглашение отменяется.
+// A private message from a person closes their row: a sent one moves to
+// replied, a not yet sent one too, and the invitation is cancelled.
 func (s *Sender) OnMessage(ctx context.Context, msg telegram.Message) error {
 	if msg.Outgoing {
 		return nil
 	}
-	// Только личка: реплика в группе ответом на приглашение не является.
+	// Private chats only: a reply in a group is not an answer to the invitation.
 	kind, userID, err := msg.Peer.Split()
 	if err != nil || kind != telegram.KindUser {
 		return nil
@@ -186,9 +187,9 @@ func (s *Sender) OnMessage(ctx context.Context, msg telegram.Message) error {
 	if err != nil {
 		return err
 	}
-	// Человек, написавший первым, снимается с очереди отдельно от ответивших:
-	// шаблон поверх начатого им разговора не уходит, но и ответом на письмо,
-	// которого он не получал, это не является.
+	// A person who wrote first is taken off the queue separately from those who
+	// replied: the template does not go over a conversation they started, but it is
+	// not a reply to a message they never received either.
 	first, err := s.service.markWroteFirst(ctx, userID, msg.Username)
 	if err != nil {
 		return err
@@ -197,9 +198,9 @@ func (s *Sender) OnMessage(ctx context.Context, msg telegram.Message) error {
 		slog.Info("recipient wrote first", "user_id", userID, "username", msg.Username, "rows", first)
 	}
 	if rows == 0 && first == 0 {
-		// Ответ в ручном диалоге строки кампании не имеет и дефектом не
-		// является: этот WARN означает реальную потерю ответа, и ручные
-		// касания превратили бы его в фон.
+		// A reply in a manual dialog has no campaign row and is not a defect:
+		// this WARN means a real loss of a reply, and manual touches
+		// would turn it into background noise.
 		touched, err := s.service.directTouched(ctx, userID, msg.Username)
 		if err != nil {
 			slog.Warn("direct journal unavailable", "username", msg.Username, "error", err)
@@ -207,10 +208,10 @@ func (s *Sender) OnMessage(ctx context.Context, msg telegram.Message) error {
 			slog.Info("inbound message in manual dialog", "user_id", userID, "username", msg.Username)
 			return nil
 		}
-		// Несопоставленное входящее - не обязательно чужой человек: это ещё и
-		// апдейт без ника от того, кому мы писали до появления tg_user_id.
-		// Молчать здесь нельзя: ответ, не закрывший строку, оставляет человека
-		// в очереди на второе касание.
+		// An unmatched incoming message is not necessarily a stranger: it may also
+		// be an update without a username from someone we wrote to before tg_user_id
+		// appeared. Staying silent here is not allowed: a reply that did not close a
+		// row leaves the person in the queue for a second touch.
 		slog.Warn("inbound message not matched",
 			"user_id", userID, "username", msg.Username)
 		return nil
@@ -219,14 +220,14 @@ func (s *Sender) OnMessage(ctx context.Context, msg telegram.Message) error {
 	return nil
 }
 
-// logIdle называет причину молчания один раз на её появление. Сама причина
-// диагностическая: ошибку её чтения хватит записать, останавливать из-за неё
-// цикл нельзя - отправке она не мешает.
+// logIdle names the reason for silence once per appearance. The reason itself
+// is diagnostic: it is enough to log the error of reading it, stopping the
+// loop over it is not allowed - it does not hinder sending.
 func (s *Sender) logIdle(ctx context.Context) {
 	idle, err := s.service.IdleReason(ctx, s.label)
 	if err != nil {
-		// Сбой диагностики дедуплицируется наравне с причиной: недоступная БД
-		// держится минутами, а витков за это время может пройти много.
+		// A diagnostics failure is deduplicated like a reason: an unreachable DB
+		// lasts for minutes, and many iterations can pass meanwhile.
 		if s.lastIdle != idleUnavailable {
 			s.lastIdle = idleUnavailable
 			slog.Warn("idle reason unavailable", "account", s.label, "error", err)
@@ -237,9 +238,9 @@ func (s *Sender) logIdle(ctx context.Context) {
 		return
 	}
 	s.lastIdle = idle.Reason
-	// Сломанный шаблон - не штатный простой: очередь стоит, пока человек не
-	// соберёт кампанию заново, и об этом обязан знать не только тот, кто откроет
-	// status. Прочие причины проходят сами: окно откроется, потолок обнулится.
+	// A broken template is not a normal idle: the queue stands until a person
+	// rebuilds the campaign, and not only the one who opens status must know.
+	// Other reasons pass by themselves: the window opens, the cap resets.
 	if idle.Reason == IdleBrokenTemplate {
 		slog.Error("sender idle", "account", s.label, "reason", idle.Reason)
 		return
@@ -247,8 +248,8 @@ func (s *Sender) logIdle(ctx context.Context) {
 	slog.Info("sender idle", "account", s.label, "reason", idle.Reason)
 }
 
-// pause - случайная задержка между витками из границ конфига: ровный темп
-// выглядит машинным, а рассылку ведёт живой аккаунт.
+// pause is a random delay between iterations within the config bounds: an even
+// pace looks machine-made, while the campaign runs through a live account.
 func (s *Sender) pause() time.Duration {
 	low, high := s.service.cfg.SendPauseMin, s.service.cfg.SendPauseMax
 	if high <= low {
@@ -257,26 +258,26 @@ func (s *Sender) pause() time.Duration {
 	return low + rand.N(high-low)
 }
 
-// delivery - решение сервиса по исходу отправки.
+// delivery is the service's decision on a send outcome.
 type delivery struct {
 	result SendResult
 	reason string
-	// stop - отказ уровня аккаунта: отправка с него прекращается целиком.
+	// stop is an account-level refusal: sending from it ceases entirely.
 	stop bool
-	// wait - переждать перед следующей строкой, если Telegram назвал срок.
+	// wait means wait before the next row if Telegram named a time.
 	wait time.Duration
 }
 
-// classifyDelivery переводит исход отправки в решение. Разбор один на все
-// отказы: FLOOD_WAIT короче порога - переждать и вернуть строку в очередь,
-// длиннее - стоп аккаунта; PEER_FLOOD и мёртвая сессия - тоже стоп аккаунта,
-// отправлять с него больше нечем; отказ по человеку - undelivered; всё неопознанное -
-// повтор, потому что брошенная навсегда неизвестная ошибка теряет человека
-// молча.
+// classifyDelivery turns a send outcome into a decision. One analysis for all
+// refusals: FLOOD_WAIT shorter than the threshold - wait and return the row to
+// the queue, longer - account stop; PEER_FLOOD and a dead session are also an
+// account stop, there is nothing left to send from it; a refusal about the
+// person - undelivered; anything unrecognized - retry, because an unknown
+// error abandoned forever loses a person silently.
 //
-// Попытку расходует только неопознанный отказ: он один способен повторяться
-// стабильно на одной строке. Отказ уровня аккаунта очередь не держит - отправка
-// с этого аккаунта останавливается целиком, - и бюджет строки не трогает.
+// Only an unrecognized refusal spends an attempt: it alone can repeat stably
+// on one row. An account-level refusal does not hold the queue - sending from
+// this account stops entirely - and does not touch the row's budget.
 func classifyDelivery(err error, threshold time.Duration) delivery {
 	if err == nil {
 		return delivery{result: ResultSent}
@@ -305,9 +306,9 @@ func classifyDelivery(err error, threshold time.Duration) delivery {
 	}
 }
 
-// StopAccount останавливает аккаунт в БД. Причина первого стопа не
-// переписывается: она называет, из-за чего аккаунт под ограничением, а
-// повторные отказы - уже следствие.
+// StopAccount stops the account in the DB. The reason of the first stop is not
+// overwritten: it names why the account is under restriction, and repeated
+// refusals are only a consequence.
 func (s *Service) StopAccount(ctx context.Context, label, reason string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE accounts SET stopped = true, stop_reason = $2, stopped_at = $3
@@ -319,13 +320,14 @@ func (s *Service) StopAccount(ctx context.Context, label, reason string) error {
 	return nil
 }
 
-// ResumeAccount снимает стоп. Только явной командой человека: снятие по таймеру
-// вернуло бы отправку с аккаунта, который Telegram всё ещё держит под
-// ограничением.
+// ResumeAccount lifts the stop. Only by an explicit human command: lifting on a
+// timer would bring back sending from an account that Telegram still holds
+// under restriction.
 //
-// Причина снятого стопа возвращается вместе с признаком «стоп был»: читать
-// состояние отдельным запросом нельзя - стоп, поставленный между чтением и
-// снятием, снялся бы молча, а в ответ и в лог уехала бы прежняя причина.
+// The reason of the lifted stop is returned together with the "was stopped"
+// flag: reading the state with a separate query is not allowed - a stop set
+// between the read and the lift would be lifted silently, and the old reason
+// would go into the response and the log.
 func (s *Service) ResumeAccount(ctx context.Context, label string) (reason string, stopped bool, err error) {
 	err = db.InTx(ctx, s.pool, func(tx pgx.Tx) error {
 		scanErr := tx.QueryRow(ctx,
@@ -353,8 +355,8 @@ func (s *Service) ResumeAccount(ctx context.Context, label string) (reason strin
 	return reason, stopped, nil
 }
 
-// AccountStopped отдаёт состояние аккаунта: на нём стоит healthcheck контейнера
-// и ответ status.
+// AccountStopped returns the account state: the container healthcheck and the
+// status response rely on it.
 func (s *Service) AccountStopped(ctx context.Context, label string) (bool, string, error) {
 	var stopped bool
 	var reason string
@@ -369,9 +371,9 @@ func (s *Service) AccountStopped(ctx context.Context, label string) (bool, strin
 	return stopped, reason, nil
 }
 
-// wait ждёт с уважением к остановке и возвращает false, если процесс попросили
-// закончить. time.Sleep здесь не годится: он не отпускает процесс по сигналу и
-// не даёт тесту прогнать цикл быстро.
+// wait waits while respecting shutdown and returns false if the process was
+// asked to finish. time.Sleep is unsuitable here: it does not release the
+// process on a signal and does not let a test run the loop fast.
 func wait(ctx context.Context, pause time.Duration) bool {
 	if pause <= 0 {
 		return ctx.Err() == nil

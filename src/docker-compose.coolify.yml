@@ -1,8 +1,9 @@
-# Канонический стек Coolify. Файл репозитория - источник истины: в Coolify он
-# кладётся в docker_compose_raw, а APP_IMAGE обновляется перед каждым выкатом.
+# Canonical Coolify stack. The repository file is the source of truth: it is
+# placed into docker_compose_raw in Coolify, and APP_IMAGE is updated before
+# every rollout.
 #
-# Секреты только через окружение Coolify: ни токена MCP, ни доступов Telegram в
-# репозитории нет и быть не должно.
+# Secrets only through the Coolify environment: neither the MCP token nor the
+# Telegram credentials are in the repository, and they must never be.
 
 services:
   postgres:
@@ -24,8 +25,9 @@ services:
       options:
         tag: "tg-agent-mcp-{{.Name}}"
 
-  # Миграции - отдельным разовым контейнером того же образа: сервис поднимается
-  # уже на готовой схеме и не мигрирует базу из-под себя при каждом рестарте.
+  # Migrations run in a separate one-shot container of the same image: the
+  # service starts on a ready schema and does not migrate the database from
+  # under itself on every restart.
   migrate:
     image: ${APP_IMAGE:?APP_IMAGE must be set}
     exclude_from_hc: true
@@ -48,11 +50,11 @@ services:
       ENV: ${ENV:-dev}
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      # Аккаунт процесса: второй аккаунт - второй контейнер с другой меткой и
-      # MCP_ENABLED=false поверх той же базы.
+      # Account of this process: a second account is a second container with
+      # another label and MCP_ENABLED=false on top of the same database.
       ACCOUNT_LABEL: ${ACCOUNT_LABEL:?ACCOUNT_LABEL must be set}
       ACCOUNT_DAILY_LIMIT: ${ACCOUNT_DAILY_LIMIT:-30}
-      # dry-run по умолчанию: живая отправка включается только вместе с ENV=prod.
+      # dry-run by default: live sending is enabled only together with ENV=prod.
       TRANSPORT: ${TRANSPORT:-dry-run}
       SEND_WINDOW_START: ${SEND_WINDOW_START:-10:00}
       SEND_WINDOW_END: ${SEND_WINDOW_END:-19:00}
@@ -60,11 +62,11 @@ services:
       SEND_PAUSE_MAX: ${SEND_PAUSE_MAX:-30m}
       FLOOD_WAIT_THRESHOLD: ${FLOOD_WAIT_THRESHOLD:-10m}
       CLAIM_STALE_AFTER: ${CLAIM_STALE_AFTER:-5m}
-      # Последний рубеж вне prod: пусто - ограничения нет, список - писать
-      # можно только перечисленным.
+      # Last guard outside prod: empty means no restriction, a list means
+      # only the listed people may be messaged.
       DEV_ALLOW_LIST: ${DEV_ALLOW_LIST:-}
-      # Вечерняя сводка: метка аккаунта, который её отправляет, и её получатели.
-      # Пусто - прежнее поведение: шлёт любой отправщик всем служебным адресатам.
+      # Evening digest: label of the account that sends it, and its recipients.
+      # Empty keeps the old behavior: any sender sends to all service recipients.
       DIGEST_ACCOUNT: ${DIGEST_ACCOUNT:-}
       DIGEST_TO: ${DIGEST_TO:-}
       MCP_ENABLED: ${MCP_ENABLED:-true}
@@ -73,8 +75,8 @@ services:
       MCP_AGENT_TOKEN: ${MCP_AGENT_TOKEN:-}
       AGENT_ALLOW_LIST: ${AGENT_ALLOW_LIST:-}
       HEALTH_ADDR: ${HEALTH_ADDR:-:8081}
-      # Доступы к живому аккаунту нужны только при TRANSPORT=live; в dry-run
-      # контуре переменные пустые и не читаются вовсе.
+      # Live account credentials are needed only with TRANSPORT=live; in the
+      # dry-run stack the variables are empty and not read at all.
       TELEGRAM_APP_ID: ${TELEGRAM_APP_ID:-}
       TELEGRAM_APP_HASH: ${TELEGRAM_APP_HASH:-}
       TELEGRAM_PHONE: ${TELEGRAM_PHONE:-}
@@ -82,14 +84,16 @@ services:
       TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-}
     volumes:
       - telegram_data:/var/lib/tg-agent-mcp
-    # Порт MCP публикуется прокси Coolify по домену сервиса; наружу из compose
-    # он не пробрасывается - доступ ограничен адресом и bearer-токеном.
+    # The MCP port is published by the Coolify proxy on the service domain; it
+    # is not forwarded outside from compose - access is limited by the address
+    # and a bearer token.
     expose:
       - "8080"
     depends_on:
       migrate:
         condition: service_completed_successfully
-    # Стоп аккаунта красит контейнер: другого канала тревоги в MVP нет.
+    # An account stop turns the container unhealthy: the MVP has no other alert
+    # channel.
     healthcheck:
       test: ["CMD", "/app", "healthcheck"]
       interval: 15s

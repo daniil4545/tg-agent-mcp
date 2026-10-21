@@ -11,66 +11,66 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/telegram"
 )
 
-// Transport - граница сервиса наружу: найти адресата по нику и отправить ему
-// текст. Интерфейс - осознанное исключение из правила «без преждевременных
-// интерфейсов»: вторая реализация (dry-run) существует с первого дня и
-// остаётся навсегда режимом dev-контура.
+// Transport is the service's boundary to the outside: find a recipient by
+// username and send them text. The interface is a deliberate exception to the
+// "no premature interfaces" rule: the second implementation (dry-run) has
+// existed from day one and stays forever as the mode of the dev stack.
 type Transport interface {
 	Resolve(ctx context.Context, username string) (Peer, error)
-	// Send отдаёт id отправленного сообщения: он ложится в журнал ручных
-	// касаний. Ноль означает «Telegram id не назвал» - так выглядит дубль по
-	// random_id, и выдумывать вместо нуля значение нельзя.
+	// Send returns the id of the sent message: it goes into the journal of manual
+	// touches. Zero means "Telegram did not name an id" - that is how a duplicate
+	// by random_id looks, and a value must not be invented in place of zero.
 	Send(ctx context.Context, peer Peer, text string, randomID int64) (int, error)
 }
 
-// Peer - найденный адресат. Ник лежит рядом со ссылкой, потому что на нём
-// стоит последний рубеж allow-list, а ссылка Telegram ника уже не содержит.
+// Peer is a found recipient. The username sits next to the reference because
+// the last allow-list guard relies on it, and a Telegram reference no longer contains the username.
 type Peer struct {
 	Username string
 	Ref      telegram.Ref
 }
 
-// Dialog расширяет Transport чтением и поиском поверх той же сессии:
-// ручная переписка и приёмка диалогов ботов портфеля. Встраивание, а не
-// отдельный интерфейс, оставляет Transport нетронутым - Sender по-прежнему
-// видит только Resolve/Send, и stubTransport в sender_test.go не обрастает
-// пустыми методами.
+// Dialog extends Transport with reading and search over the same session:
+// manual correspondence and acceptance testing of bot dialogs. Embedding,
+// not a separate interface, leaves Transport untouched - Sender still sees
+// only Resolve/Send, and stubTransport in sender_test.go does not grow
+// empty methods.
 //
-// Lookup существует отдельно от Resolve намеренно: Resolve несёт рубеж
-// checkAllowed (DEV_ALLOW_LIST), через него идёт кампанийная и ручная
-// отправка живому человеку, и снимать рубеж нельзя. Но чтение диалога обязано
-// работать и при непустом allow-list - иначе dev-контур не даёт прочитать
-// диалог с тем, кому уже нельзя писать. Разделение снимает этот конфликт:
-// Lookup рубеж не применяет, Resolve остаётся как есть. Не разделяя эти два
-// пути, следующая правка либо оставляет чтение неработающим в dev, либо
-// снимает checkAllowed из Resolve - а это дыра в живой отправке. Тест
-// TestAllowListStillHoldsCampaignSend закрывает второй риск.
+// Lookup exists separately from Resolve on purpose: Resolve carries the
+// checkAllowed guard (DEV_ALLOW_LIST), through it goes the campaign and manual
+// send to a live person, and the guard must not be lifted. But reading a dialog
+// must work with a non-empty allow-list too - otherwise the dev stack cannot
+// read a dialog with someone who can no longer be written to. The split resolves
+// this conflict: Lookup does not apply the guard, Resolve stays as it is. Without
+// separating these two paths, the next edit either leaves reading broken in dev or
+// removes checkAllowed from Resolve - and that is a hole in live sending. The test
+// TestAllowListStillHoldsCampaignSend covers the second risk.
 type Dialog interface {
 	Transport
-	// Lookup - резолв адресата для чтения, без рубежа allow-list.
+	// Lookup resolves a recipient for reading, without the allow-list guard.
 	Lookup(ctx context.Context, username string) (Peer, error)
 	Find(ctx context.Context, query string, limit int) ([]Contact, error)
 	History(ctx context.Context, peer Peer, limit int) ([]ChatMessage, error)
 	Dialogs(ctx context.Context, limit int) ([]DialogInfo, error)
 }
 
-// Contact - найденный при поиске человек, ещё не обязательно адресат. Ссылки
-// на него здесь нет намеренно: отправка и чтение резолвят ник заново, а поле,
-// похожее на готовый адрес, звало бы писать по нему без резолва.
+// Contact is a person found by search, not necessarily a recipient. There is no
+// reference to them here on purpose: sending and reading resolve the username
+// anew, and a field resembling a ready address would invite writing to it without resolving.
 type Contact struct {
 	Username string
 	Name     string
-	// IsContact - человек в адресной книге аккаунта.
+	// IsContact means the person is in the account's address book.
 	IsContact bool
-	// Known - адрес уже был известен сервису. Признака диалога это не даёт:
-	// туда же попадает ник, резолвленный под чтение.
+	// Known means the address was already known to the service. It is not a sign
+	// of a dialog: a username resolved for reading lands here too.
 	Known bool
-	// Exact - ник равен запросу без учёта регистра: это тот, кого искали, а не
-	// похожий ник другого человека.
+	// Exact means the username equals the query, case-insensitively: this is the one
+	// that was searched for, not a similar username of another person.
 	Exact bool
 }
 
-// ChatMessage - сообщение диалога в плоском виде для ответа агенту.
+// ChatMessage is a dialog message in a flat form for the answer to the agent.
 type ChatMessage struct {
 	ID        int
 	Text      string
@@ -79,34 +79,34 @@ type ChatMessage struct {
 	Outgoing  bool
 }
 
-// DialogInfo - строка списка диалогов с последним сообщением.
+// DialogInfo is a row of the dialog list with the last message.
 type DialogInfo struct {
 	Username string
 	Name     string
 	Ref      telegram.Ref
 	Unread   int
-	// Broadcast - канал вещания, а не место для переписки. Голый факт платформы;
-	// слово для выдачи собирает mcp.go из вида Ref и этого флага.
+	// Broadcast is a broadcast channel, not a place for correspondence. A bare platform fact;
+	// the word for the output is assembled by mcp.go from the Ref kind and this flag.
 	Broadcast bool
 	Last      ChatMessage
 }
 
-// ErrNotAllowed - отказ последнего рубежа: ник вне allow-list.
+// ErrNotAllowed is the refusal of the last guard: a username outside the allow-list.
 var ErrNotAllowed = errors.New("recipient is not in the allow list")
 
-// ReasonNotAllowed - причина строки, снятой allow-list.
+// ReasonNotAllowed is the reason of a row removed by the allow-list.
 const ReasonNotAllowed = "not_allowed"
 
-// Delivery - зафиксированная отправка dry-run: что и кому ушло бы живьём.
+// Delivery is a recorded dry-run send: what would have gone to whom live.
 type Delivery struct {
 	Username string
 	Text     string
 	RandomID int64
 }
 
-// DryRunTransport - транспорт dev-контура: пишет отправку в лог и запоминает
-// вызовы, наружу не ходит вовсе. Живому человеку из него не уйдёт ни одного
-// сообщения, поэтому сквозной прогон кампании безопасен.
+// DryRunTransport is the transport of the dev stack: it writes the send to the
+// log and remembers the calls, and never goes outside. Not a single message
+// can reach a live person from it, so an end-to-end campaign run is safe.
 type DryRunTransport struct {
 	allowed map[string]bool
 
@@ -114,7 +114,7 @@ type DryRunTransport struct {
 	sent []Delivery
 }
 
-// NewDryRunTransport собирает dry-run с рубежом allow-list из конфига.
+// NewDryRunTransport builds a dry-run with the allow-list guard from the config.
 func NewDryRunTransport(cfg Config) *DryRunTransport {
 	return &DryRunTransport{allowed: allowedSet(cfg.DevAllowList)}
 }
@@ -126,9 +126,9 @@ func (t *DryRunTransport) Resolve(_ context.Context, username string) (Peer, err
 	return Peer{Username: username}, nil
 }
 
-// Send dry-run отдаёт синтетический возрастающий id - номер отправки в
-// собственном журнале: живого id нет, а строка журнала с NULL не отличима от
-// сбоя записи.
+// Send in dry-run returns a synthetic increasing id - the send number in its
+// own journal: there is no live id, and a journal row with NULL is
+// indistinguishable from a write failure.
 func (t *DryRunTransport) Send(_ context.Context, peer Peer, text string, randomID int64) (int, error) {
 	if err := checkAllowed(t.allowed, peer.Username); err != nil {
 		return 0, err
@@ -142,33 +142,32 @@ func (t *DryRunTransport) Send(_ context.Context, peer Peer, text string, random
 	return messageID, nil
 }
 
-// Sent отдаёт копию зафиксированных отправок.
+// Sent returns a copy of the recorded sends.
 func (t *DryRunTransport) Sent() []Delivery {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return append([]Delivery(nil), t.sent...)
 }
 
-// Lookup dry-run не ходит никуда - живого Telegram нет вовсе, поэтому
-// возвращает подставного Peer по нику без рубежа. Честность подставного
-// ответа держит инструмент MCP отдельной строкой в тексте.
+// Lookup in dry-run goes nowhere - there is no live Telegram at all, so it
+// returns a fake Peer by username without the guard. The honesty of the fake
+// answer is held by the MCP tool with a separate line in the text.
 func (t *DryRunTransport) Lookup(_ context.Context, username string) (Peer, error) {
 	return Peer{Username: username}, nil
 }
 
-// Find dry-run отдаёт один синтетический контакт по запросу: реального
-// поиска нет, а формат ответа обязан совпадать с живым транспортом. Ник
-// нормализуется тем же CleanQuery, что и живой поиск, и запрос по форме ника
-// помечается точным: иначе ответ предупреждает «точного ника нет» про ник,
-// который сам же и вернул.
+// Find in dry-run returns one synthetic contact for a query: there is no real
+// search, and the response format must match the live transport. The username
+// is normalized by the same CleanQuery as the live search, and a query shaped
+// like a username is marked exact: otherwise the answer would warn "no exact
+// username" about a username it returned itself.
 func (t *DryRunTransport) Find(_ context.Context, query string, _ int) ([]Contact, error) {
 	needle := telegram.CleanQuery(query)
 	return []Contact{{Username: needle, Name: query, Exact: telegram.IsUsername(needle)}}, nil
 }
 
-// History dry-run отдаёт собственный журнал t.sent как исходящие сообщения -
-// единственная история, которая у dry-run есть на самом деле, входящих не
-// бывает.
+// History in dry-run returns its own journal t.sent as outgoing messages -
+// the only history dry-run really has, there are no incoming ones.
 func (t *DryRunTransport) History(_ context.Context, peer Peer, limit int) ([]ChatMessage, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -186,20 +185,20 @@ func (t *DryRunTransport) History(_ context.Context, peer Peer, limit int) ([]Ch
 	return history, nil
 }
 
-// Dialogs dry-run отдаёт пусто: список диалогов живому аккаунту не
-// подделать честно, в отличие от History, где есть свой журнал отправок.
+// Dialogs in dry-run returns empty: a dialog list of a live account cannot be
+// faked honestly, unlike History, where there is its own send journal.
 func (t *DryRunTransport) Dialogs(_ context.Context, _ int) ([]DialogInfo, error) {
 	return nil, nil
 }
 
-// LiveTransport - живой MTProto поверх пакета telegram. В этом срезе не
-// запускается: конфиг не даёт поднять TRANSPORT=live вне prod.
+// LiveTransport is live MTProto over the telegram package. It is not started
+// in this slice: the config does not allow TRANSPORT=live outside prod.
 type LiveTransport struct {
 	allowed map[string]bool
 	client  *telegram.Client
 }
 
-// NewLiveTransport собирает живой транспорт с тем же рубежом allow-list.
+// NewLiveTransport builds the live transport with the same allow-list guard.
 func NewLiveTransport(cfg Config, client *telegram.Client) *LiveTransport {
 	return &LiveTransport{allowed: allowedSet(cfg.DevAllowList), client: client}
 }
@@ -215,9 +214,9 @@ func (t *LiveTransport) Resolve(ctx context.Context, username string) (Peer, err
 	return Peer{Username: username, Ref: ref}, nil
 }
 
-// Send отдаёт исход как есть: узнанный Telegram random_id - это успех, клиент
-// уже вернул его без ошибки, и второго сообщения человек не получил. Id такого
-// дубля нулевой, и ноль уходит в журнал как есть.
+// Send returns the outcome as is: a random_id recognized by Telegram is a
+// success, the client already returned it without an error, and the person did
+// not get a second message. The id of such a duplicate is zero, and zero goes into the journal as is.
 func (t *LiveTransport) Send(ctx context.Context, peer Peer, text string, randomID int64) (int, error) {
 	if err := checkAllowed(t.allowed, peer.Username); err != nil {
 		return 0, err
@@ -226,9 +225,9 @@ func (t *LiveTransport) Send(ctx context.Context, peer Peer, text string, random
 	return result.MessageID, err
 }
 
-// Lookup резолвит адресата для чтения без рубежа allow-list - см. комментарий
-// на интерфейсе Dialog. Отправка через этот Peer не идёт, поэтому обходить
-// checkAllowed здесь безопасно.
+// Lookup resolves a recipient for reading without the allow-list guard - see
+// the comment on the Dialog interface. A send does not go through this Peer, so
+// bypassing checkAllowed here is safe.
 func (t *LiveTransport) Lookup(ctx context.Context, username string) (Peer, error) {
 	ref, err := t.client.ResolveUsername(ctx, username)
 	if err != nil {
@@ -255,8 +254,8 @@ func (t *LiveTransport) Find(ctx context.Context, query string, limit int) ([]Co
 	return contacts, nil
 }
 
-// History берёт новейшую страницу истории: beforeID=0 у клиента telegram
-// означает «от последнего сообщения».
+// History takes the newest page of history: beforeID=0 in the telegram client
+// means "from the last message".
 func (t *LiveTransport) History(ctx context.Context, peer Peer, limit int) ([]ChatMessage, error) {
 	messages, err := t.client.History(ctx, peer.Ref, limit, 0)
 	if err != nil {
@@ -288,13 +287,13 @@ func (t *LiveTransport) Dialogs(ctx context.Context, limit int) ([]DialogInfo, e
 	return result, nil
 }
 
-// chatMessageFrom приводит сообщение пакета telegram к плоскому виду
-// ChatMessage - общий шаг History и последнего сообщения в Dialogs.
+// chatMessageFrom converts a telegram package message to the flat ChatMessage
+// form - a step shared by History and the last message in Dialogs.
 func chatMessageFrom(m telegram.Message) ChatMessage {
 	return ChatMessage{ID: m.ID, Text: m.Text, MediaKind: m.MediaKind, SentAt: m.SentAt, Outgoing: m.Outgoing}
 }
 
-// allowedSet - множество разрешённых ников; nil означает «ограничения нет».
+// allowedSet is the set of allowed usernames; nil means "no restriction".
 func allowedSet(list []string) map[string]bool {
 	if len(list) == 0 {
 		return nil
@@ -306,11 +305,11 @@ func allowedSet(list []string) map[string]bool {
 	return set
 }
 
-// checkAllowed - последний рубеж перед выходом наружу, за всеми рубежами БД.
-// Пустой список никого не ограничивает (боевая рассылка идёт по списку из
-// кампании), непустой пропускает только перечисленных - и живой транспорт, и
-// dry-run одинаково: рубеж не должен зависеть от того, каким транспортом
-// подняли процесс.
+// checkAllowed is the last guard before going outside, behind all the DB guards.
+// An empty list restricts nobody (the live campaign goes by the campaign's
+// list), a non-empty one lets through only those listed - both the live
+// transport and dry-run alike: the guard must not depend on which transport
+// the process was started with.
 func checkAllowed(allowed map[string]bool, username string) error {
 	if allowed == nil || allowed[normalizeUsername(username)] {
 		return nil

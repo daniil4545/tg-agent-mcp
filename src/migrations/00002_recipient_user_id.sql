@@ -1,7 +1,7 @@
 -- +goose Up
--- Ник Telegram приходит в апдейте не всегда: короткое входящее несёт только id
--- отправителя. Без сохранённого id ответ такого человека не находит свою строку
--- и приглашение считается неотвеченным.
+-- A Telegram username is not always present in an update: a short incoming
+-- message carries only the sender id. Without a stored id the reply of such a
+-- person does not find its row, and the invitation counts as unanswered.
 ALTER TABLE recipients ADD COLUMN tg_user_id BIGINT;
 
 CREATE INDEX recipients_tg_user_id_idx ON recipients (tg_user_id) WHERE tg_user_id IS NOT NULL;

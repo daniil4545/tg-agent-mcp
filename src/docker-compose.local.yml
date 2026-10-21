@@ -1,17 +1,18 @@
-# Боевой контур на машине владельца: MCP-сервер и отправщик рядом с Claude Code.
+# Live stack on the owner's machine: the MCP server and the sender next to
+# Claude Code.
 #
-# Решение владельца 02.09.2026: сервис живёт локально, а не на VPS. Причины
-# три - Claude Code ходит на 127.0.0.1 и не нужен ни домен, ни туннель;
-# отправка идёт с домашнего IP, а не с датацентрового, что для живого
-# Telegram-аккаунта естественнее; наружу не открыто ничего.
+# Owner's decision of 2026-09-02: the service runs locally, not on a VPS.
+# Three reasons: Claude Code connects to 127.0.0.1, so no domain or tunnel is
+# needed; sending goes from a home IP rather than a datacenter one, which is
+# more natural for a live Telegram account; nothing is exposed outside.
 #
-# Цена: рассылка идёт, пока машина включена. Дневная порция небольшая, окно
-# 10:00-19:00 будней, так что обычного рабочего дня хватает; сутки сна означают
-# сутки без отправок, а не потерю очереди.
+# Cost: sending runs only while the machine is on. The daily batch is small and
+# the window is 10:00-19:00 on weekdays, so an ordinary working day is enough;
+# a day of sleep means a day without sending, not a lost queue.
 #
-# Проект и тома отдельные от docker-compose.yml: тот поднимает базу для тестов,
-# и `make test` её пересобирает. Держать в ней очередь кампании нельзя - там
-# лежит знание, кому уже писали.
+# The project and volumes are separate from docker-compose.yml: that one starts
+# the test database, and `make test` rebuilds it. The campaign queue must not
+# live there - it holds the record of who was already messaged.
 name: tg-agent-mcp-live
 
 services:
@@ -21,7 +22,8 @@ services:
       POSTGRES_USER: tg_agent_mcp
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_DB: tg_agent_mcp
-    # Порт наружу не публикуется: к базе ходит только приложение в этой сети.
+    # The port is not published: only the application in this network reaches the
+    # database.
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -55,29 +57,31 @@ services:
   app:
     build: .
     environment:
-      # prod, потому что живая отправка возможна только в нём; контур боевой,
-      # хоть и стоит на ноутбуке.
+      # prod, because live sending is possible only there; the stack is live
+      # even though it runs on a laptop.
       ENV: ${ENV:-prod}
       DATABASE_URL: postgres://tg_agent_mcp:${POSTGRES_PASSWORD}@postgres:5432/tg_agent_mcp?sslmode=disable
       LOG_LEVEL: ${LOG_LEVEL:-info}
       ACCOUNT_LABEL: ${ACCOUNT_LABEL:?ACCOUNT_LABEL must be set}
       ACCOUNT_DAILY_LIMIT: ${ACCOUNT_DAILY_LIMIT:-20}
-      # dry-run по умолчанию: live включается руками после входа в аккаунт и
-      # пилота на своих.
+      # dry-run by default: live is switched on by hand after logging in to the
+      # account and a pilot on the owner's own accounts.
       TRANSPORT: ${TRANSPORT:-dry-run}
       SEND_WINDOW_START: ${SEND_WINDOW_START:-10:00}
       SEND_WINDOW_END: ${SEND_WINDOW_END:-19:00}
-      # Пауза - весь виток отправщика: на ней он замечает и старт кампании, и
-      # открытие окна. 10-30 минут - темп пилота 07.09.2026.
+      # The pause is the whole sender iteration: it is when the sender notices
+      # both a campaign start and the window opening. 10-30 minutes is the pilot
+      # pace of 2026-09-07.
       SEND_PAUSE_MIN: ${SEND_PAUSE_MIN:-10m}
       SEND_PAUSE_MAX: ${SEND_PAUSE_MAX:-30m}
       FLOOD_WAIT_THRESHOLD: ${FLOOD_WAIT_THRESHOLD:-10m}
       CLAIM_STALE_AFTER: ${CLAIM_STALE_AFTER:-5m}
-      # Последний рубеж: пусто - ограничения нет, список - писать можно только
-      # перечисленным. На пилоте здесь стоят свои ники.
+      # Last guard: empty means no restriction, a list means only the listed
+      # people may be messaged. During the pilot this holds the owner's own
+      # usernames.
       DEV_ALLOW_LIST: ${DEV_ALLOW_LIST:-}
-      # Вечерняя сводка: метка аккаунта, который её отправляет, и её получатели.
-      # Пусто - прежнее поведение: шлёт любой отправщик всем служебным адресатам.
+      # Evening digest: label of the account that sends it, and its recipients.
+      # Empty keeps the old behavior: any sender sends to all service recipients.
       DIGEST_ACCOUNT: ${DIGEST_ACCOUNT:-}
       DIGEST_TO: ${DIGEST_TO:-}
       MCP_ENABLED: "true"
@@ -93,7 +97,7 @@ services:
       TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-}
     volumes:
       - telegram_data:/var/lib/tg-agent-mcp
-    # Только петля: эндпоинт не должен быть виден даже в домашней сети.
+    # Loopback only: the endpoint must not be visible even on the home network.
     ports:
       - "127.0.0.1:${MCP_PORT:-8087}:8080"
       - "127.0.0.1:${HEALTH_PORT:-8088}:8081"

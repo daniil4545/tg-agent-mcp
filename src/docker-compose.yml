@@ -1,9 +1,10 @@
-# Локальный Postgres для разработки. Имя проекта задано явно: по умолчанию
-# Compose берёт его из имени каталога, а каталог src есть у каждого сервиса
-# - без этой строки тома разных проектов сошлись бы в один.
+# Local Postgres for development. The project name is set explicitly: by
+# default Compose takes it from the directory name, and every service has a
+# src directory - without this line the volumes of different projects would
+# merge into one.
 #
-# Порт 5433, не 5432: соседний сервис lead-qualifier поднимает свой
-# Postgres на 5432, и оба сервиса не редкость держать поднятыми одновременно.
+# Port 5433, not 5432: another local Postgres usually occupies 5432, and it is
+# common to keep both up at once.
 name: tg-agent-mcp
 
 services:

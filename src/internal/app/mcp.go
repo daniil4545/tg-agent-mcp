@@ -18,146 +18,148 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/telegram"
 )
 
-// Две группы инструментов поверх одного аккаунта: шесть кампанийных ходят
-// только в базу, четыре диалоговых - через Chat в живую сессию. Кампания в
-// системе одна, поэтому id никуда не передаётся - единственность держат
-// частичные индексы БД.
+// tools holds two groups of MCP tools over a single account: six campaign tools
+// that touch only the database, and four dialog tools that go through Chat into
+// the live session. There is one campaign in the system, so no id is passed
+// around - partial database indexes enforce the uniqueness.
 type tools struct {
 	service *Service
 	chat    *Chat
 }
 
 type loadArgs struct {
-	Template string `json:"template" jsonschema:"текст приглашения; {имя} заменяется на имя получателя"`
-	Title    string `json:"title" jsonschema:"название кампании для отчётов"`
+	Template string `json:"template" jsonschema:"invitation text; the Russian placeholder {имя} is replaced with the recipient's name"`
+	Title    string `json:"title" jsonschema:"campaign title used in reports"`
 }
 
 type personArgs struct {
-	ContactID int64  `json:"contact_id" jsonschema:"id контакта amoCRM"`
-	LeadID    int64  `json:"lead_id,omitempty" jsonschema:"id сделки amoCRM"`
-	Name      string `json:"name" jsonschema:"имя для подстановки в шаблон"`
-	Username  string `json:"username" jsonschema:"ник Telegram; без ника человек в рассылку не попадёт"`
+	ContactID int64  `json:"contact_id" jsonschema:"amoCRM contact id"`
+	LeadID    int64  `json:"lead_id,omitempty" jsonschema:"amoCRM lead id"`
+	Name      string `json:"name" jsonschema:"name substituted into the template"`
+	Username  string `json:"username" jsonschema:"Telegram username; a person without one is not added to the campaign"`
 }
 
 type addArgs struct {
-	People []personArgs `json:"people" jsonschema:"пачка получателей, не больше 50 за вызов"`
+	People []personArgs `json:"people" jsonschema:"batch of recipients, at most 50 per call"`
 }
 
-// omitempty у флагов не косметика: без него схема объявляет поле обязательным, и
-// вызов без аргументов отбивается проверкой схемы, не дойдя до обработчика.
+// The omitempty on the flags is not cosmetic: without it the schema declares the
+// field required, and a call with no arguments is rejected by schema validation
+// before it reaches the handler.
 type stopArgs struct {
-	Cancel bool `json:"cancel,omitempty" jsonschema:"true - отменить кампанию вместе с очередью; false (по умолчанию) - пауза, start продолжит"`
+	Cancel bool `json:"cancel,omitempty" jsonschema:"true cancels the campaign together with its queue; false (default) pauses it, and start resumes it"`
 }
 
 type resumeArgs struct {
-	Label string `json:"label" jsonschema:"метка аккаунта, с которого снимается стоп"`
+	Label string `json:"label" jsonschema:"label of the account whose stop is cleared"`
 }
 
 type statusArgs struct {
-	Full       bool  `json:"full,omitempty" jsonschema:"добавить построчный итог по получателям; без значения отчёт идёт без него"`
-	CampaignID int64 `json:"campaign_id,omitempty" jsonschema:"id кампании из load_campaign; без него - текущая: идущая, черновик, пауза, иначе последняя закрытая"`
+	Full       bool  `json:"full,omitempty" jsonschema:"add a per-recipient breakdown; when omitted the report has none"`
+	CampaignID int64 `json:"campaign_id,omitempty" jsonschema:"campaign id from load_campaign; when omitted the current campaign is shown: the running one, else the draft, else the paused one, else the last closed one"`
 }
 
 type findArgs struct {
-	Query string `json:"query" jsonschema:"ник ищется точно, точное совпадение идёт первым с пометкой; без него показываются похожие ники с предупреждением. Имя ищется среди контактов и своих диалогов"`
+	Query string `json:"query" jsonschema:"a Telegram username is matched exactly, and the exact match is listed first with a mark; if there is none, similar usernames are listed with a warning. A name is searched among contacts and existing dialogs"`
 }
 
 type sendArgs struct {
-	Username string `json:"username" jsonschema:"ник Telegram без @"`
-	Text     string `json:"text" jsonschema:"текст сообщения: непустой, не длиннее 4096 символов"`
+	Username string `json:"username" jsonschema:"Telegram username without @"`
+	Text     string `json:"text" jsonschema:"message text: non-empty, at most 4096 characters"`
 }
 
 type readArgs struct {
-	Username    string `json:"username" jsonschema:"ник Telegram без @"`
-	Depth       int    `json:"depth,omitempty" jsonschema:"сколько последних сообщений показать; без значения двадцать, потолок сто"`
-	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"сколько секунд ждать чужую реплику; без значения не ждать вовсе, потолок 45 секунд - дольше вызов не переживает клиент. Нужно ждать дольше - зовите tg_read повторно, ожидание продолжится с того же места"`
+	Username    string `json:"username" jsonschema:"Telegram username without @"`
+	Depth       int    `json:"depth,omitempty" jsonschema:"how many of the latest messages to show; default twenty, maximum one hundred"`
+	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"how many seconds to wait for a reply from the other side; default is not to wait at all, maximum 45 seconds because the client does not keep a longer call alive. To wait longer, call tg_read again: the wait continues from the same point"`
 }
 
 type dialogsArgs struct {
-	Limit int `json:"limit,omitempty" jsonschema:"сколько диалогов показать; без значения двадцать, потолок сто"`
+	Limit int `json:"limit,omitempty" jsonschema:"how many dialogs to show; default twenty, maximum one hundred"`
 }
 
-// hint даёт указатель для полей подсказок MCP, где SDK отличает «не указано» от false.
+// hint returns a pointer for MCP annotation fields where the SDK tells "not set" from false.
 func hint(value bool) *bool { return &value }
 
-// NewMCPServer собирает MCP-сервер управления кампанией.
+// NewMCPServer builds the MCP server that manages the campaign and the dialogs.
 func NewMCPServer(service *Service, chat *Chat) *mcp.Server {
 	handlers := &tools{service: service, chat: chat}
 	server := mcp.NewServer(&mcp.Implementation{Name: "tg-agent-mcp", Version: "1.0.0"}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "load_campaign",
-		Description: "Создать черновик рассылки с шаблоном сообщения. Прежний черновик отменяется.",
+		Description: "Create a campaign draft with a message template. The previous draft is cancelled.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(true), IdempotentHint: false, OpenWorldHint: hint(false)},
 	}, handlers.loadCampaign)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_recipients",
-		Description: "Добавить пачку получателей (до 50) в черновик и получить отчёт отсева с превью сообщения. Для служебных адресатов из DEV_ALLOW_LIST правило «одно сообщение» не действует, стоп-лист - действует.",
+		Description: "Add a batch of recipients (up to 50) to the draft and get a screening report with a message preview. For service recipients from DEV_ALLOW_LIST the one-message rule does not apply; the stop list does.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: false, OpenWorldHint: hint(false)},
 	}, handlers.addRecipients)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "start",
-		Description: "Запустить черновик или продолжить кампанию с паузы.",
+		Description: "Start the draft, or resume a paused campaign.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: false, OpenWorldHint: hint(true)},
 	}, handlers.start)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "stop",
-		Description: "Поставить кампанию на паузу или отменить её вместе с очередью.",
+		Description: "Pause the campaign, or cancel it together with its queue.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(true), IdempotentHint: true, OpenWorldHint: hint(false)},
 	}, handlers.stop)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "resume_account",
-		Description: "Снять стоп с аккаунта после проверки человеком.",
+		Description: "Clear the stop on an account after a human has checked it.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(false)},
 	}, handlers.resumeAccount)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "status",
-		Description: "Счётчики кампании, аккаунты со стопами и превью сообщения; campaign_id показывает названную кампанию, full добавляет построчный итог.",
+		Description: "Campaign counters, accounts with stops and a message preview; campaign_id shows a named campaign, full adds a per-recipient breakdown.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(false)},
 	}, handlers.status)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_find",
-		Description: "Найти человека: точный ник или имя среди контактов и своих диалогов. Точное совпадение ника идёт первым с пометкой, без него показываются похожие ники с предупреждением. Наружу поиск ничего не пишет.",
+		Description: "Find a person: an exact username, or a name among contacts and existing dialogs. An exact username match is listed first with a mark; without one, similar usernames are listed with a warning. The search sends nothing to anyone.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(true)},
 	}, handlers.find)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_send",
-		Description: "Написать человеку в личку руками. Первое касание незнакомца идёт в окно отправки и в дневной потолок; после отправки человек закрыт для кампаний. Для служебных адресатов из DEV_ALLOW_LIST окно, потолок и правило «одно сообщение» не действуют, стоп-лист - действует.",
+		Description: "Send a direct message to a person by hand. The first touch of a stranger goes through the send window and the daily cap; after sending, the person is closed to campaigns. For service recipients from DEV_ALLOW_LIST the window, the cap and the one-message rule do not apply; the stop list does.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: false, OpenWorldHint: hint(true)},
 	}, handlers.send)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_read",
-		Description: "Показать личный диалог и, если попросили, дождаться чужой реплики; группы и каналы не читаются.",
+		Description: "Show a private dialog and, if asked, wait for a reply from the other side; groups and channels are not read.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(true)},
 	}, handlers.read)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_dialogs",
-		Description: "Список диалогов - личных, групп и каналов - с непрочитанными и последним сообщением; вид каждой строки назван, писать (tg_send) можно только человеку.",
+		Description: "List dialogs - private chats, groups and channels - with unread counts and the last message; each row names its kind, and only a person can be written to (tg_send).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(true)},
 	}, handlers.dialogs)
 
 	return server
 }
 
-// Роли токенов. UserID обязан быть непустым: по нему SDK привязывает сессию к
-// токену, и пустое значение эту привязку выключает.
+// Token roles. UserID must be non-empty: the SDK binds a session to its token
+// through it, and an empty value switches that binding off.
 const (
 	roleOwner = "owner"
 	roleAgent = "agent"
 )
 
-// MCPHandler - эндпоинт управления: streamable HTTP за bearer-токеном. Роли
-// две: владелец видит все инструменты и подтверждает мутации на стороне Клода,
-// агент видит два диалоговых, и рубеж его адресатов держит сервис.
+// MCPHandler is the management endpoint: streamable HTTP behind a bearer token.
+// There are two roles: the owner sees every tool and confirms mutations on the
+// MCP client side, the agent sees the two dialog tools, and the service itself
+// guards the agent's recipients.
 func MCPHandler(service *Service, chat *Chat) http.Handler {
 	owner := NewMCPServer(service, chat)
 	agent := NewAgentServer(service, chat)
@@ -174,16 +176,16 @@ func MCPHandler(service *Service, chat *Chat) http.Handler {
 		}
 		return nil
 	}, nil)
-	// AllowMissingExpiration: токен статический и срока в себе не несёт;
-	// без этого флага middleware отклоняет его как просроченный.
+	// AllowMissingExpiration: the token is static and carries no expiry;
+	// without this flag the middleware rejects it as expired.
 	verify := staticTokens(service.cfg.MCPToken, service.cfg.MCPAgentToken)
 	guard := auth.RequireBearerToken(verify, &auth.RequireBearerTokenOptions{AllowMissingExpiration: true})
 	return guard(streamable)
 }
 
-// staticTokens сверяет предъявленный токен с настроенными за постоянное время:
-// посимвольное сравнение выдаёт токен по времени ответа. Пустой токен агента
-// роль не открывает.
+// staticTokens compares the presented token with the configured ones in
+// constant time: a character-by-character comparison leaks the token through
+// response timing. An empty agent token opens no role.
 func staticTokens(owner, agent string) auth.TokenVerifier {
 	return func(_ context.Context, presented string, _ *http.Request) (*auth.TokenInfo, error) {
 		if subtle.ConstantTimeCompare([]byte(presented), []byte(owner)) == 1 {
@@ -192,21 +194,21 @@ func staticTokens(owner, agent string) auth.TokenVerifier {
 		if agent != "" && subtle.ConstantTimeCompare([]byte(presented), []byte(agent)) == 1 {
 			return &auth.TokenInfo{UserID: roleAgent}, nil
 		}
-		// Отказ авторизации виден только снаружи: клиент получает 401 без
-		// объяснения, и без этой записи причину не отличить от лежащего
-		// сервиса. Токен не пишется, только его длина - разошедшийся токен
-		// обычно пуст или обрезан.
+		// An authorization failure is visible only from outside: the client gets
+		// a 401 with no explanation, and without this entry the cause cannot be
+		// told from a service that is down. The token is not logged, only its
+		// length - a mismatched token is usually empty or truncated.
 		slog.Warn("mcp token rejected", "presented_len", len(presented))
 		return nil, auth.ErrInvalidToken
 	}
 }
 
-// errAgentRecipient - отказ агентского доступа: адресат не тестовый аккаунт.
-var errAgentRecipient = errors.New("ник вне AGENT_ALLOW_LIST: агентский доступ пишет и читает только тестовые аккаунты")
+// errAgentRecipient is the refusal of agent access: the recipient is not a test account.
+var errAgentRecipient = errors.New("username is outside AGENT_ALLOW_LIST: agent access writes to and reads from test accounts only")
 
-// agentTools - диалоговые инструменты за списком тестовых аккаунтов. Ник
-// сверяется до Chat той же нормализацией, что в Chat: иначе запись с @ или
-// ссылкой разошлась бы со списком.
+// agentTools are the dialog tools behind the list of test accounts. The
+// username is checked before Chat with the same normalization Chat uses:
+// otherwise a form with @ or a link would diverge from the list.
 type agentTools struct {
 	tools   *tools
 	allowed map[string]bool
@@ -234,8 +236,8 @@ func (a *agentTools) read(ctx context.Context, req *mcp.CallToolRequest, args re
 	return a.tools.read(ctx, req, args)
 }
 
-// NewAgentServer собирает сервер агентского доступа. Новый инструмент сюда
-// не попадает сам: агенту он открывается только осознанно.
+// NewAgentServer builds the agent-access server. A new tool does not land here
+// by itself: it is opened to the agent only deliberately.
 func NewAgentServer(service *Service, chat *Chat) *mcp.Server {
 	handlers := &agentTools{
 		tools:   &tools{service: service, chat: chat},
@@ -245,13 +247,13 @@ func NewAgentServer(service *Service, chat *Chat) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_send",
-		Description: "Написать тестовому аккаунту из AGENT_ALLOW_LIST в личку, чтобы проверить бота. Любой другой ник сервис отклоняет.",
+		Description: "Send a direct message to a test account from AGENT_ALLOW_LIST to check the bot. The service rejects any other username.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: hint(false), IdempotentHint: false, OpenWorldHint: hint(true)},
 	}, handlers.send)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tg_read",
-		Description: "Показать личный диалог с тестовым аккаунтом из AGENT_ALLOW_LIST и, если попросили, дождаться его реплики.",
+		Description: "Show the private dialog with a test account from AGENT_ALLOW_LIST and, if asked, wait for its reply.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: hint(false), IdempotentHint: true, OpenWorldHint: hint(true)},
 	}, handlers.read)
 
@@ -265,44 +267,45 @@ func (t *tools) loadCampaign(ctx context.Context, _ *mcp.CallToolRequest, args l
 	}
 	slog.Info("campaign loaded", "campaign_id", id, "title", strings.TrimSpace(args.Title))
 
-	// Шаблон печатается щедро и с переносами строк: проверка «что уйдёт человеку»
-	// глазами - единственный способ поймать удвоенную скобку в третьей строке.
-	// Режется он только на длинных письмах, и длина называется всегда.
+	// The template is printed generously, with line breaks: reading "what the
+	// person will receive" by eye is the only way to catch a doubled brace on the
+	// third line. It is cut only on long messages, and the length is always stated.
 	template := strings.TrimSpace(args.Template)
 	var text strings.Builder
-	// Длина называется та же, что проверяет отказ: с запасом на имя и по счёту
-	// Telegram. Голая длина шаблона обещала бы запас, которого нет, - дописанные
-	// пятьдесят символов дали бы отказ с другой, большей цифрой.
+	// The length stated is the one the refusal checks: with a reserve for the
+	// name and counted the way Telegram counts. The bare template length would
+	// promise headroom that does not exist - fifty more characters would be
+	// refused with a different, larger number.
 	used, budget := renderedLen(template)
-	fmt.Fprintf(&text, "Черновик создан: %s (id %d).\n", strings.TrimSpace(args.Title), id)
+	fmt.Fprintf(&text, "Draft created: %s (id %d).\n", strings.TrimSpace(args.Title), id)
 	if budget > 0 {
-		fmt.Fprintf(&text, "Шаблон с подставленным именем занимает %d из %d символов по счёту Telegram (из них %d - запас на имя):\n%s\n\n",
+		fmt.Fprintf(&text, "The template with the name substituted takes %d of %d characters by Telegram's count (%d of them reserved for the name):\n%s\n\n",
 			used, maxTextLen, budget, cutRunes(template, templateShown))
 	} else {
-		fmt.Fprintf(&text, "Шаблон занимает %d из %d символов по счёту Telegram:\n%s\n\n",
+		fmt.Fprintf(&text, "The template takes %d of %d characters by Telegram's count:\n%s\n\n",
 			used, maxTextLen, cutRunes(template, templateShown))
 	}
-	// Шаблон без подстановки законен, но молчаливая рассылка без обращения - не
-	// то, что обычно имели в виду, и увидеть это надо до старта.
+	// A template without a placeholder is legal, but a mailing with no form of
+	// address is not what is usually meant, and it must be seen before start.
 	if hasName(template) {
-		fmt.Fprintf(&text, "Подстановка %s в шаблоне есть: получателю без имени письмо уйдёт без обращения, вместе с запятой. Проверьте, что текст читается и так.\n", namePlaceholder)
+		fmt.Fprintf(&text, "The template has the %s placeholder: a recipient without a name gets the message with no form of address, comma included. Check that the text reads well that way.\n", namePlaceholder)
 	} else {
-		fmt.Fprintf(&text, "Подстановки %s в шаблоне нет: письма уйдут без обращения по имени.\n", namePlaceholder)
+		fmt.Fprintf(&text, "The template has no %s placeholder: messages go out with no form of address by name.\n", namePlaceholder)
 	}
-	fmt.Fprintf(&text, "Дальше: add_recipients пачками до %d человек, затем start.", maxBatch)
+	fmt.Fprintf(&text, "Next: add_recipients in batches of up to %d people, then start.", maxBatch)
 	return textResult(text.String())
 }
 
-// addRecipients работает с единственным черновиком: id кампании инструмент не
-// принимает, потому что черновик в системе один и его держит частичный индекс.
+// addRecipients works with the single draft: the tool takes no campaign id,
+// because there is one draft in the system and a partial index enforces it.
 func (t *tools) addRecipients(ctx context.Context, _ *mcp.CallToolRequest, args addArgs) (*mcp.CallToolResult, any, error) {
 	campaignID, err := t.service.draftCampaign(ctx)
 	if err != nil {
 		return nil, nil, toolError(err)
 	}
 
-	// personArgs повторяет Person поле в поле и отличается только тегами схемы:
-	// доменный тип не обязан знать про формат аргументов инструмента.
+	// personArgs repeats Person field for field and differs only in schema tags:
+	// the domain type need not know the format of the tool arguments.
 	people := make([]Person, 0, len(args.People))
 	for _, item := range args.People {
 		people = append(people, Person(item))
@@ -316,11 +319,12 @@ func (t *tools) addRecipients(ctx context.Context, _ *mcp.CallToolRequest, args 
 		"offered", len(args.People), "accepted", report.Accepted, "skipped", report.Skipped)
 
 	var text strings.Builder
-	fmt.Fprintf(&text, "Принято: %d из %d.\n", report.Accepted, len(args.People))
+	fmt.Fprintf(&text, "Accepted: %d of %d.\n", report.Accepted, len(args.People))
 	writeSkipped(&text, report.Skipped)
 
-	// Отчёт строится по черновику, в который вставляли, а не по «текущей»
-	// кампании: при живой активной сверка списка ушла бы по чужим счётчикам.
+	// The report is built for the draft that was inserted into, not for the
+	// "current" campaign: with a live active campaign, checking the list would
+	// go by another campaign's counters.
 	status, err := t.service.StatusOf(ctx, campaignID, false)
 	if err != nil {
 		return nil, nil, err
@@ -341,16 +345,16 @@ func (t *tools) start(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (
 		return nil, nil, err
 	}
 
-	// Что именно запущено, называет отчёт ниже: при паре «черновик плюс пауза»
-	// start берёт черновик, и оператор должен увидеть, какая кампания пошла и
-	// что осталось ждать.
+	// The report below names what exactly was started: with a "draft plus pause"
+	// pair, start takes the draft, and the operator must see which campaign went
+	// and what is left waiting.
 	var text strings.Builder
-	fmt.Fprintf(&text, "Кампания запущена (id %d). Отправка идёт в окно %s-%s по будням, не больше дневного потолка аккаунта.\n",
+	fmt.Fprintf(&text, "Campaign started (id %d). Sending runs in the window %s-%s on weekdays, within the account's daily cap.\n",
 		id, t.service.cfg.SendWindowStart, t.service.cfg.SendWindowEnd)
 	writeCampaign(&text, status)
-	// Строка выше - правило, эта - положение дел сейчас: запуск в 22:10 пятницы
-	// иначе выглядит как пошедшая отправка. Причина уже посчитана в status,
-	// запросов не прибавляется.
+	// The line above is the rule, this one is the state of things now: a start at
+	// 22:10 on a Friday would otherwise look like sending in progress. The reason
+	// is already computed in status, so no queries are added.
 	writeIdle(&text, status)
 	writeAccounts(&text, status)
 	return textResult(text.String())
@@ -362,8 +366,8 @@ func (t *tools) stop(ctx context.Context, _ *mcp.CallToolRequest, args stopArgs)
 		return nil, nil, toolError(err)
 	}
 	slog.Info("campaign stopped", "campaign_id", id, "cancelled", args.Cancel)
-	// Отчёт по той кампании, которую остановили: рядом может лежать черновик, и
-	// «текущая» кампания в ответе была бы уже им.
+	// The report is about the campaign that was stopped: a draft may sit next to
+	// it, and the "current" campaign in the answer would already be the draft.
 	status, err := t.service.StatusOf(ctx, id, false)
 	if err != nil {
 		return nil, nil, err
@@ -371,9 +375,9 @@ func (t *tools) stop(ctx context.Context, _ *mcp.CallToolRequest, args stopArgs)
 
 	var text strings.Builder
 	if args.Cancel {
-		text.WriteString("Кампания отменена, очередь снята: продолжить её больше нельзя.\n")
+		text.WriteString("Campaign cancelled, queue cleared: it cannot be resumed.\n")
 	} else {
-		text.WriteString("Кампания на паузе. Отправок нет; start продолжит с того же места.\n")
+		text.WriteString("Campaign paused. Nothing is being sent; start resumes from the same place.\n")
 	}
 	writeCampaign(&text, status)
 	return textResult(text.String())
@@ -381,32 +385,34 @@ func (t *tools) stop(ctx context.Context, _ *mcp.CallToolRequest, args stopArgs)
 
 func (t *tools) resumeAccount(ctx context.Context, _ *mcp.CallToolRequest, args resumeArgs) (*mcp.CallToolResult, any, error) {
 	label := strings.TrimSpace(args.Label)
-	// Состояние и снятие - одна транзакция под блокировкой строки: стоп,
-	// поставленный между чтением и снятием, иначе снялся бы молча, а ответ и лог
-	// назвали бы прежнюю причину. Ответ «стоп снят» на живом аккаунте тоже
-	// невозможен - снимать или нет, решает та же транзакция.
+	// Reading the state and clearing it are one transaction under a row lock: a
+	// stop placed between the read and the clear would otherwise be cleared
+	// silently, while the answer and the log named the previous reason. The
+	// answer "stop cleared" on a live account is impossible too - the same
+	// transaction decides whether to clear.
 	reason, stopped, err := t.service.ResumeAccount(ctx, label)
 	if err != nil {
 		return nil, nil, t.unknownAccount(ctx, label, err)
 	}
 	if !stopped {
-		// Про отправку тут ничего не обещается: транзакция смотрела один стоп, а
-		// молчать очередь может из-за окна, потолка или отсутствия кампании.
-		return textResult(fmt.Sprintf("Стопа на аккаунте %q нет: снимать нечего. Идёт ли отправка, покажет status.", label))
+		// Nothing is promised about sending here: the transaction looked at one
+		// stop, and the queue can be quiet because of the window, the cap or the
+		// lack of a campaign.
+		return textResult(fmt.Sprintf("Account %q has no stop: nothing to clear. status shows whether sending is running.", label))
 	}
-	// Снятие стопа - единственное действие, которое человек делает руками после
-	// разбора аккаунта: в логе оно должно стоять рядом с самим стопом.
+	// Clearing a stop is the only action a human takes by hand after reviewing
+	// an account: in the log it must stand next to the stop itself.
 	slog.Info("account resumed", "account", label, "stop_reason", reason)
-	return textResult(fmt.Sprintf("Стоп с аккаунта %q снят (стоял из-за %s). Отправка возобновится в ближайшее окно.",
+	return textResult(fmt.Sprintf("Stop cleared on account %q (it was set because of %s). Sending resumes in the next window.",
 		label, reason))
 }
 
 func (t *tools) status(ctx context.Context, _ *mcp.CallToolRequest, args statusArgs) (*mcp.CallToolResult, any, error) {
 	var status StatusReport
 	var err error
-	// Любой ненулевой id идёт в StatusOf, включая отрицательный: «параметр не
-	// передан» - это только ноль, а отчёт о текущей кампании в ответ на явную
-	// опечатку в id читается как отчёт о запрошенной.
+	// Any non-zero id goes to StatusOf, a negative one included: "parameter not
+	// passed" is only zero, and a report on the current campaign in answer to an
+	// explicit typo in the id reads as a report on the requested one.
 	if args.CampaignID != 0 {
 		status, err = t.service.StatusOf(ctx, args.CampaignID, args.Full)
 	} else {
@@ -415,10 +421,11 @@ func (t *tools) status(ctx context.Context, _ *mcp.CallToolRequest, args statusA
 	if err != nil {
 		return nil, nil, err
 	}
-	// StatusOf по чужому id отдаёт отчёт без кампании: аккаунты вместо
-	// запрошенного итога читаются как «кампания пуста», а не как опечатка в id.
+	// StatusOf on an unknown id returns a report without a campaign: accounts in
+	// place of the requested totals read as "the campaign is empty", not as a
+	// typo in the id.
 	if args.CampaignID != 0 && status.Campaign == nil {
-		return nil, nil, fmt.Errorf("кампании с id %d нет: id называет ответ load_campaign, без campaign_id status покажет текущую",
+		return nil, nil, fmt.Errorf("there is no campaign with id %d: ids come from the load_campaign answer, and without campaign_id status shows the current one",
 			args.CampaignID)
 	}
 
@@ -440,15 +447,15 @@ func (t *tools) find(ctx context.Context, _ *mcp.CallToolRequest, args findArgs)
 	}
 	var text strings.Builder
 	t.writeContour(&text)
-	// Запрос приводится к тому же виду, в каком его искал telegram.SearchUsers:
-	// сырой «@Ivan» не прошёл бы проверку формы ника, а в тексте дал бы «@@».
+	// The query is brought to the same form telegram.SearchUsers searched with:
+	// a raw "@Ivan" would fail the username shape check and print "@@" in the text.
 	needle := telegram.CleanQuery(args.Query)
 	writeContacts(&text, needle, found)
 	return textResult(text.String())
 }
 
-// send отчитывается ценой касания, а не фактом отправки: журнал закрывает
-// человека для всех будущих кампаний, и решение об этом принимает вызывающий.
+// send reports the price of the touch, not the fact of sending: the journal
+// closes the person to all future campaigns, and the caller makes that decision.
 func (t *tools) send(ctx context.Context, _ *mcp.CallToolRequest, args sendArgs) (*mcp.CallToolResult, any, error) {
 	sent, err := t.chat.Send(ctx, args.Username, args.Text)
 	if err != nil {
@@ -457,15 +464,15 @@ func (t *tools) send(ctx context.Context, _ *mcp.CallToolRequest, args sendArgs)
 
 	var text strings.Builder
 	t.writeContour(&text)
-	fmt.Fprintf(&text, "Отправлено @%s", sent.Username)
+	fmt.Fprintf(&text, "Sent to @%s", sent.Username)
 	if sent.UserID > 0 {
 		fmt.Fprintf(&text, " (id %d)", sent.UserID)
 	}
-	text.WriteString(".\nКасание записано: этот человек больше не попадёт ни в одну кампанию.\n")
+	text.WriteString(".\nTouch recorded: this person will not be included in any campaign from now on.\n")
 	if sent.Cold {
-		text.WriteString("Это первое касание незнакомца: оно ушло в дневной потолок аккаунта.\n")
+		text.WriteString("This is the first touch of a stranger: it counted toward the account's daily cap.\n")
 	}
-	text.WriteString("Дальше: tg_read с wait_seconds дождётся ответа.\n")
+	text.WriteString("Next: tg_read with wait_seconds waits for the reply.\n")
 	return textResult(text.String())
 }
 
@@ -476,14 +483,14 @@ func (t *tools) read(ctx context.Context, _ *mcp.CallToolRequest, args readArgs)
 	}
 	var text strings.Builder
 	t.writeContour(&text)
-	// Счёт идёт по истории, а не по всему напечатанному: глубина резала именно
-	// её, а дождавшаяся реплика пришла сверх среза.
+	// The count goes by the history, not by everything printed: depth cut the
+	// history, and a reply that arrived during the wait comes on top of the cut.
 	writeHistoryCap(&text, args.Depth, len(talk.Messages))
-	// Про само ожидание строка молчит: сколько ждали на деле, ниже говорит
-	// writeConversation, и «ждали 45» рядом с «реплика через 6 секунд» - два
-	// взаимоисключающих числа подряд.
+	// This line says nothing about the wait itself: how long it really lasted is
+	// told by writeConversation, and "waited 45" next to "reply after 6 seconds"
+	// would be two mutually exclusive numbers in a row.
 	if args.WaitSeconds > int(maxWait.Seconds()) {
-		fmt.Fprintf(&text, "Просили ждать %d секунд, потолок одного вызова - %d: дольше вызов не переживает клиент.\n",
+		fmt.Fprintf(&text, "Asked to wait %d seconds, the limit of one call is %d: the client does not keep a longer call alive.\n",
 			args.WaitSeconds, int(maxWait.Seconds()))
 	}
 	writeConversation(&text, talk)
@@ -502,74 +509,76 @@ func (t *tools) dialogs(ctx context.Context, _ *mcp.CallToolRequest, args dialog
 	return textResult(text.String())
 }
 
-// writeHistoryCap называет срез чтения диалога. Оговорка нужна не только при
-// явном depth больше потолка: самый частый вызов идёт без аргумента и режется
-// умолчанием, а урезанный молча диалог читается как весь. Молчит она там, где
-// история короче глубины: диалог показан целиком, и «показано не всё» отправляло
-// бы агента искать несуществующий остаток.
+// writeHistoryCap names the cut of a dialog read. The caveat is needed not only
+// when an explicit depth exceeds the limit: the most common call has no
+// argument and is cut by the default, and a silently truncated dialog reads as
+// a whole one. It stays silent where the history is shorter than the depth: the
+// dialog is shown in full, and "not everything is shown" would send the agent
+// looking for a remainder that does not exist.
 func writeHistoryCap(text *strings.Builder, asked, shown int) {
 	if asked > maxHistory {
-		fmt.Fprintf(text, "Просили %d последних сообщений, потолок %d.\n", asked, maxHistory)
+		fmt.Fprintf(text, "Asked for the last %d messages, the limit is %d.\n", asked, maxHistory)
 	}
 	depth := capped(asked, defaultHistory, maxHistory)
 	if shown < depth {
 		return
 	}
 	if depth < maxHistory {
-		fmt.Fprintf(text, "Показано не всё: глубина %d исчерпана, более ранние сообщения остались за срезом. "+
-			"Нужно дальше - позовите tg_read с depth до %d.\n", depth, maxHistory)
+		fmt.Fprintf(text, "Not everything is shown: the depth of %d is used up, earlier messages are beyond the cut. "+
+			"To go further, call tg_read with depth up to %d.\n", depth, maxHistory)
 		return
 	}
-	fmt.Fprintf(text, "Показано не всё: глубина %d исчерпана, более ранние сообщения остались за срезом, "+
-		"глубже потолка инструмент не читает.\n", depth)
+	fmt.Fprintf(text, "Not everything is shown: the depth of %d is used up, earlier messages are beyond the cut, "+
+		"and the tool does not read deeper than the limit.\n", depth)
 }
 
-// writeDialogsCap называет срез списка диалогов: без этой строки «показано 12»
-// читается как «всего 12», и агент делает вывод «человека в диалогах нет» по
-// началу списка. Молчит там, где список короче предела: показаны все диалоги
-// аккаунта, и совет позвать tg_dialogs с большим limit был бы ложным.
+// writeDialogsCap names the cut of the dialog list: without this line "shown
+// 12" reads as "12 in total", and the agent concludes "the person is not in the
+// dialogs" from the head of the list. It stays silent where the list is shorter
+// than the limit: all the account's dialogs are shown, and advice to call
+// tg_dialogs with a larger limit would be false.
 func writeDialogsCap(text *strings.Builder, asked, shown int) {
 	if asked > maxHistory {
-		fmt.Fprintf(text, "Просили %d диалогов, потолок %d.\n", asked, maxHistory)
+		fmt.Fprintf(text, "Asked for %d dialogs, the limit is %d.\n", asked, maxHistory)
 	}
 	limit := capped(asked, defaultHistory, maxHistory)
 	if shown < limit {
 		return
 	}
-	fmt.Fprintf(text, "Показано %d последних диалогов, дальше по списку могут быть ещё.", limit)
+	fmt.Fprintf(text, "Showing the %d most recent dialogs; there may be more further down the list.", limit)
 	if limit < maxHistory {
-		fmt.Fprintf(text, " Нужно больше - позовите tg_dialogs с limit до %d.\n", maxHistory)
+		fmt.Fprintf(text, " To see more, call tg_dialogs with limit up to %d.\n", maxHistory)
 		return
 	}
-	text.WriteString(" Глубже потолка инструмент не смотрит: человека, которого не видно, ищите точным ником через tg_find.\n")
+	text.WriteString(" The tool does not look deeper than the limit: look for a person who is not visible by exact username with tg_find.\n")
 }
 
-// unknownAccount переводит отказ чтения аккаунта. Незнакомая метка - его
-// единственная причина, зависящая от вызывающего, и она обязана называть, где
-// взять правильную; прочие отказы (база недоступна) уходят как есть, а не под
-// видом опечатки в метке.
+// unknownAccount translates the refusal of an account read. An unknown label is
+// its only cause that depends on the caller, and it must say where to find the
+// right one; other failures (database unavailable) pass through as they are,
+// not disguised as a typo in the label.
 func (t *tools) unknownAccount(ctx context.Context, label string, err error) error {
 	var known int
 	if scanErr := t.service.pool.QueryRow(ctx,
 		`SELECT count(*) FROM accounts WHERE label = $1`, label).Scan(&known); scanErr != nil || known > 0 {
 		return toolError(err)
 	}
-	return fmt.Errorf("аккаунта с меткой %q сервис не знает: метки аккаунтов перечисляет status, позовите resume_account с одной из них",
+	return fmt.Errorf("the service does not know an account labelled %q: status lists the account labels, call resume_account with one of them",
 		label)
 }
 
-// writeContour называет подставной контур первой строкой: dry-run отдаёт
-// собственный журнал отправок как историю, и без этой строки агент принял бы
-// его за настоящий диалог.
+// writeContour names the stand-in environment on the first line: dry-run
+// returns its own send journal as history, and without this line the agent
+// would take it for a real dialog.
 func (t *tools) writeContour(text *strings.Builder) {
 	if t.service.cfg.Transport != "live" {
-		text.WriteString("Контур dry-run: живого Telegram нет, ответ подставной.\n")
+		text.WriteString("Dry-run mode: there is no live Telegram, the answer is a stand-in.\n")
 	}
 }
 
-// draftCampaign находит единственный черновик. Инструменты кампании id не
-// передают: черновик в системе один, и его единственность держит частичный
-// уникальный индекс, а не договорённость вызывающего.
+// draftCampaign finds the single draft. The campaign tools pass no id: there
+// is one draft in the system, and a partial unique index enforces it, not an
+// agreement by the caller.
 func (s *Service) draftCampaign(ctx context.Context) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx, `SELECT id FROM campaigns WHERE status = 'draft'`).Scan(&id)
@@ -582,55 +591,56 @@ func (s *Service) draftCampaign(ctx context.Context) (int64, error) {
 	return id, nil
 }
 
-// toolError переводит доменный отказ в текст, из которого оператору понятно,
-// что делать дальше: иначе Клод показывает владельцу обёрнутую ошибку запроса.
+// toolError translates a domain refusal into text from which the operator can
+// tell what to do next: otherwise the MCP client shows the owner a wrapped
+// query error.
 func toolError(err error) error {
 	switch {
 	case errors.Is(err, ErrNoDraft):
 		return noDraftError(err)
 	case errors.Is(err, ErrNothingToStart):
-		return errors.New("запускать нечего: нет ни черновика, ни кампании на паузе. Создайте черновик через load_campaign")
+		return errors.New("nothing to start: there is neither a draft nor a paused campaign. Create a draft with load_campaign")
 	case errors.Is(err, ErrNothingToStop):
 		return nothingToStopError(err)
 	case errors.Is(err, ErrNothingToCancel):
-		return errors.New("отменять нечего: нет ни идущей кампании, ни черновика, ни паузы")
+		return errors.New("nothing to cancel: there is no running campaign, no draft and no paused campaign")
 	case errors.Is(err, ErrActiveCampaign):
-		return errors.New("кампания уже идёт: сначала остановите её через stop, потом запускайте следующую")
+		return errors.New("a campaign is already running: stop it with stop first, then start the next one")
 	case errors.Is(err, ErrManyCampaigns):
-		return errors.New("кампаний для запуска больше одной: лишние снимите через stop с cancel")
+		return errors.New("more than one campaign can be started: remove the extra ones with stop and cancel")
 	case errors.Is(err, ErrEmptyDraft):
-		return errors.New("в черновике нет пригодных получателей: добавьте их через add_recipients")
+		return errors.New("the draft has no usable recipients: add them with add_recipients")
 	case errors.Is(err, ErrUnknownPlaceholder):
 		return unknownPlaceholderError(err)
 	case errors.Is(err, ErrTemplateTooLong):
 		return longTemplateError(err)
 	case errors.Is(err, ErrNotDraft):
-		return errors.New("получателей принимает только черновик: запущенная кампания список не пополняет")
+		return errors.New("only a draft accepts recipients: a started campaign does not take additions to its list")
 	case errors.Is(err, ErrBatchTooBig):
-		return fmt.Errorf("в пачке больше %d человек: разбейте список на части", maxBatch)
+		return fmt.Errorf("the batch has more than %d people: split the list into parts", maxBatch)
 	case errors.Is(err, ErrNoUsername):
-		return errors.New("ник пустой или не похож на ник Telegram: 5-32 символа латиницей, цифры и подчёркивание, не в конце и не двойное; без @")
+		return errors.New("the username is empty or does not look like a Telegram username: 5-32 characters, Latin letters, digits and underscore, not at the end and not doubled; no @")
 	case errors.Is(err, ErrEmptyText):
-		return errors.New("текст пустой: назовите, что отправить")
+		return errors.New("the text is empty: say what to send")
 	case errors.Is(err, ErrTextTooLong):
-		return fmt.Errorf("сообщение длиннее %d символов: разбейте его на части", maxTextLen)
+		return fmt.Errorf("the message is longer than %d characters: split it into parts", maxTextLen)
 	case errors.Is(err, ErrNotPrivate):
-		return errors.New("это не личный чат: инструменты работают только с личкой, группы и каналы не поддерживаются")
+		return errors.New("this is not a private chat: the tools work with private dialogs only, groups and channels are not supported")
 	case errors.Is(err, ErrAccountStopped):
 		return accountStopError(err)
 	case errors.Is(err, ErrStopList):
-		return errors.New("человек в стоп-листе: ему не уходит ничего - ни кампанией, ни руками")
+		return errors.New("the person is on the stop list: nothing is sent to them - neither by a campaign nor by hand")
 	case errors.Is(err, ErrCampaignSending):
 		return campaignHoldError(err)
 	case errors.Is(err, ErrDirectPending):
-		return fmt.Errorf("предыдущее сообщение этому человеку в неизвестном состоянии: оно могло уйти. "+
-			"Подождите %d минут и посмотрите диалог через tg_read", waitMinutes(err))
+		return fmt.Errorf("the previous message to this person is in an unknown state: it may have gone out. "+
+			"Wait %d minutes and look at the dialog with tg_read", waitMinutes(err))
 	case errors.Is(err, ErrColdWindow):
-		return errors.New("первое касание незнакомца уходит только в окно отправки по будням: дождитесь окна; реплика в идущем диалоге временем не ограничена")
+		return errors.New("the first touch of a stranger goes out only in the send window on weekdays: wait for the window; a reply in an ongoing dialog is not limited by time")
 	case errors.Is(err, ErrColdLimit):
-		return errors.New("дневной потолок аккаунта израсходован: первое касание незнакомца подождёт до завтра; реплика в идущем диалоге проходит")
+		return errors.New("the account's daily cap is used up: the first touch of a stranger waits until tomorrow; a reply in an ongoing dialog goes through")
 	case errors.Is(err, ErrNotAllowed):
-		return errors.New("ник вне DEV_ALLOW_LIST: в этом контуре писать можно только перечисленным")
+		return errors.New("username is outside DEV_ALLOW_LIST: in this environment only the listed usernames can be written to")
 	default:
 		var failure *telegram.Failure
 		if errors.As(err, &failure) {
@@ -640,178 +650,183 @@ func toolError(err error) error {
 	}
 }
 
-// unknownPlaceholderError перечисляет чужие подстановки: без списка человек
-// ищет опечатку глазами по всему шаблону.
+// unknownPlaceholderError lists the foreign placeholders: without the list the
+// person hunts for the typo by eye across the whole template.
 func unknownPlaceholderError(err error) error {
 	var bad *badTemplate
 	if !errors.As(err, &bad) {
-		return fmt.Errorf("в шаблоне остались фигурные скобки, которых сервис не понимает: он знает одну подстановку - %s",
+		return fmt.Errorf("the template has curly braces the service does not understand: it knows one placeholder - %s",
 			namePlaceholder)
 	}
 	quoted := make([]string, 0, len(bad.spots))
 	for _, spot := range bad.spots {
 		quoted = append(quoted, fmt.Sprintf("%q", spot))
 	}
-	// Показаны не все места: без этой оговорки человек правит три, получает отказ
-	// снова и читает его как новый дефект.
+	// Not all the places are shown: without this caveat the person fixes three,
+	// gets the refusal again and reads it as a new defect.
 	shown := ""
 	if bad.total > len(bad.spots) {
-		shown = fmt.Sprintf(" (первые %d из %d)", len(bad.spots), bad.total)
+		shown = fmt.Sprintf(" (first %d of %d)", len(bad.spots), bad.total)
 	}
-	// Совет зависит от того, где лежит шаблон: текст в аргументе правится на
-	// месте, а шаблон существующей кампании не правит ни один инструмент, и
-	// обещать «уберите скобки» там значит советовать невозможное.
+	// The advice depends on where the template lives: text in an argument is
+	// fixed in place, but the template of an existing campaign is edited by no
+	// tool, and promising "remove the braces" there would advise the impossible.
 	if bad.stored {
-		return fmt.Errorf("шаблон этой кампании сервис не разобрал%s: %s. Отправки по ней не будет. "+
-			"Шаблон существующей кампании не правится ни одним инструментом: соберите кампанию заново - "+
-			"load_campaign с исправленным текстом, затем add_recipients (список придётся собрать заново), затем start; "+
-			"негодную снимите через stop с cancel",
+		return fmt.Errorf("the service could not parse this campaign's template%s: %s. Nothing will be sent for it. "+
+			"No tool edits the template of an existing campaign: rebuild the campaign - "+
+			"load_campaign with the corrected text, then add_recipients (the list has to be collected again), then start; "+
+			"remove the broken one with stop and cancel",
 			shown, strings.Join(quoted, ", "))
 	}
-	return fmt.Errorf("в шаблоне остались фигурные скобки, которых сервис не понимает%s: %s. "+
-		"Он знает одну подстановку - %s; всё остальное, включая двойные скобки и незакрытую скобку, уйдёт в письмо как есть, "+
-		"поэтому уберите лишние скобки или закройте подстановку",
+	return fmt.Errorf("the template has curly braces the service does not understand%s: %s. "+
+		"It knows one placeholder - %s; everything else, including double braces and an unclosed brace, goes into the message as is, "+
+		"so remove the extra braces or close the placeholder",
 		shown, strings.Join(quoted, ", "), namePlaceholder)
 }
 
-// longTemplateError называет обе цифры: без них «сократите» не говорит,
-// насколько резать.
+// longTemplateError names both numbers: without them "shorten it" does not say
+// how much to cut.
 func longTemplateError(err error) error {
 	var long *longTemplate
 	if !errors.As(err, &long) {
-		return fmt.Errorf("шаблон не влезает в сообщение Telegram: предел %d символов", maxTextLen)
+		return fmt.Errorf("the template does not fit into a Telegram message: the limit is %d characters", maxTextLen)
 	}
 	if long.budget == 0 {
-		return fmt.Errorf("шаблон не влезает в сообщение Telegram: занято %d символов из %d. Лишних символов: %d",
+		return fmt.Errorf("the template does not fit into a Telegram message: it takes %d of %d characters. Excess characters: %d",
 			long.used, long.limit, long.used-long.limit)
 	}
-	return fmt.Errorf("шаблон не влезает в сообщение Telegram: занято %d символов из %d, из них %d - грубый запас на имя "+
-		"(по %d на каждую подстановку; настоящее имя короче или длиннее, его длину сервис проверит на импорте). "+
-		"Лишних символов: %d",
+	return fmt.Errorf("the template does not fit into a Telegram message: it takes %d of %d characters, %d of them a rough reserve for the name "+
+		"(%d per placeholder; a real name is shorter or longer, and the service checks its length on import). "+
+		"Excess characters: %d",
 		long.used, long.limit, long.budget, nameBudget, long.used-long.limit)
 }
 
-// noDraftError различает пустую систему и живую кампанию рядом. Совет «создайте
-// черновик» верен в обоих случаях, но при идущей кампании он звучит как «всё
-// пропало»: агент обязан прочитать, что кампания цела, а список пополняет не
-// она.
+// noDraftError tells an empty system from a live campaign next to it. The
+// advice "create a draft" is right in both cases, but with a running campaign
+// it sounds like "everything is lost": the agent must read that the campaign is
+// intact and that it is not the one that takes additions to its list.
 func noDraftError(err error) error {
 	var near *nearCampaign
 	if !errors.As(err, &near) {
-		return errors.New("черновика нет: создайте его через load_campaign, потом добавляйте получателей")
+		return errors.New("there is no draft: create one with load_campaign, then add recipients")
 	}
-	return fmt.Errorf("черновика нет, а получателей принимает только он. Рядом кампания %d %q (%s), её список уже не пополнить: "+
-		"load_campaign заведёт черновик рядом с ней, саму кампанию он не тронет",
+	return fmt.Errorf("there is no draft, and only a draft accepts recipients. Next to it is campaign %d %q (%s), whose list can no longer be extended: "+
+		"load_campaign creates a draft next to it and does not touch the campaign itself",
 		near.id, near.title, near.status)
 }
 
-// nothingToStopError отвечает по тому, что стоит рядом: повтор stop на уже
-// приостановленной кампании иначе читается как «кампании больше нет», хотя её
-// продолжает start.
+// nothingToStopError answers from what stands nearby: a repeated stop on an
+// already paused campaign would otherwise read as "the campaign is gone",
+// although start resumes it.
 func nothingToStopError(err error) error {
 	var near *nearCampaign
 	if !errors.As(err, &near) {
-		return errors.New("останавливать нечего: идущей кампании нет")
+		return errors.New("nothing to stop: no campaign is running")
 	}
 	if near.status != "stopped" {
-		return fmt.Errorf("останавливать нечего: идущей кампании нет, рядом только черновик %d %q - "+
-			"его снимает stop с cancel", near.id, near.title)
+		return fmt.Errorf("nothing to stop: no campaign is running, there is only draft %d %q next to it - "+
+			"stop with cancel removes it", near.id, near.title)
 	}
-	// Совет обязан считаться с черновиком рядом: start берёт черновик раньше
-	// паузы, cancel бьёт по нему раньше паузы, и «продолжите start» запустило бы
-	// не ту кампанию, а «снимите cancel» снесло бы собранный список.
+	// The advice must take the draft nearby into account: start takes the draft
+	// before the pause, cancel hits it before the pause, and "resume with start"
+	// would launch the wrong campaign, while "remove with cancel" would wipe the
+	// collected list.
 	if near.draft != 0 {
-		return fmt.Errorf("останавливать нечего: идущей кампании нет, кампания %d %q стоит на паузе. "+
-			"Но рядом черновик %d, и обе команды пойдут по нему: start запустит черновик, stop с cancel снимет черновик. "+
-			"До кампании %d очередь дойдёт не раньше, чем запущенная кампания будет остановлена: start при идущей кампании отказывает",
+		return fmt.Errorf("nothing to stop: no campaign is running, campaign %d %q is paused. "+
+			"But there is also draft %d, and both commands act on it: start will launch the draft, stop with cancel will cancel the draft. "+
+			"The queue reaches campaign %d only after the started campaign is stopped: start refuses while a campaign is running",
 			near.id, near.title, near.draft, near.id)
 	}
-	// Соседние паузы тоже меняют совет: при нескольких stopped без черновика
-	// start не выбирает сам и отказывает - обещать «продолжит start» нельзя.
+	// Neighbouring pauses change the advice too: with several stopped campaigns
+	// and no draft, start does not choose by itself and refuses - "start will
+	// resume it" cannot be promised.
 	if near.pauses > 1 {
-		return fmt.Errorf("останавливать нечего: идущей кампании нет, а на паузе кампаний несколько (%d), первая - %d %q. "+
-			"start при нескольких паузах отказывается выбирать: снимите лишние через stop с cancel, тогда start продолжит оставшуюся",
+		return fmt.Errorf("nothing to stop: no campaign is running, and several campaigns are paused (%d), the first is %d %q. "+
+			"With several pauses start refuses to choose: remove the extra ones with stop and cancel, then start resumes the remaining one",
 			near.pauses, near.id, near.title)
 	}
-	return fmt.Errorf("останавливать нечего: идущей кампании нет, а кампания %d %q уже на паузе - "+
-		"её продолжит start, а снимет вместе с очередью stop с cancel",
+	return fmt.Errorf("nothing to stop: no campaign is running, and campaign %d %q is already paused - "+
+		"start resumes it, and stop with cancel removes it together with its queue",
 		near.id, near.title)
 }
 
-// campaignHoldError называет состояние кампании, которая держит человека, и
-// действие, которое по нему сработает. Состояний три, а не два. Идущая кампания
-// разберётся сама, но только пока движется очередь: вне окна отправки строка не
-// сдвинется до ближайшего буднего утра, и «повторите через несколько минут» бьёт
-// агента в стену. Кампания на паузе не разберётся никогда, и cancel бьёт по
-// кампаниям в порядке active, draft, stopped - при живой соседней он снимет её,
-// а не эту. Закрытую кампанию (отменена или завершена) сюда приводит только
-// живой claim: строку прямо сейчас несёт отправщик, и действия по ней нет вовсе.
+// campaignHoldError names the state of the campaign that holds the person and
+// the action that will work against it. There are three states, not two. A
+// running campaign sorts itself out, but only while the queue moves: outside
+// the send window the row does not move until the next weekday morning, and
+// "retry in a few minutes" sends the agent into a wall. A paused campaign never
+// sorts itself out, and cancel hits campaigns in the order active, draft,
+// stopped - with a live neighbour it removes that one, not this one. A closed
+// campaign (cancelled or finished) gets here only through a live claim: the
+// sender is carrying the row right now, and there is no action on it at all.
 //
-// Про «зависший claim в status» здесь не говорится: у возвращённой в очередь
-// строки claimed_at пуст, и этот счётчик её не видит - совет отправлял бы агента
-// за несуществующим признаком.
+// "A stuck claim in status" is not mentioned here: a row returned to the queue
+// has an empty claimed_at, and that counter does not see it - the advice would
+// send the agent after a sign that does not exist.
 func campaignHoldError(err error) error {
 	var hold *campaignHold
 	if !errors.As(err, &hold) {
-		return errors.New("этому человеку пишет кампания: повторите позже, иначе он получит два сообщения")
+		return errors.New("a campaign is writing to this person: retry later, otherwise they will get two messages")
 	}
 	switch hold.status {
 	case "active":
-		// Идущая кампания со сломанным шаблоном очередь не двигает вовсе, и совет
-		// «повторите через несколько минут» отправлял бы агента на второй круг.
+		// A running campaign with a broken template does not move the queue at
+		// all, and "retry in a few minutes" would send the agent in a second circle.
 		if hold.broken {
-			return fmt.Errorf("человека держит строка кампании %d %q, но её очередь стоит: шаблон кампании не разобран. "+
-				"Сама она не разберётся - снимите кампанию через stop с cancel, тогда человек освободится",
+			return fmt.Errorf("the person is held by a row of campaign %d %q, but its queue is stalled: the campaign's template could not be parsed. "+
+				"It will not sort itself out - remove the campaign with stop and cancel, and the person is freed",
 				hold.id, hold.title)
 		}
 		if hold.queueOpensAt.IsZero() {
-			return fmt.Errorf("этому человеку прямо сейчас пишет кампания %d %q: очередь закроет строку сама, повторите через несколько минут",
+			return fmt.Errorf("campaign %d %q is writing to this person right now: the queue will close the row itself, retry in a few minutes",
 				hold.id, hold.title)
 		}
-		return fmt.Errorf("человека держит строка идущей кампании %d %q, но очередь стоит вне окна отправки: "+
-			"строка сдвинется не раньше %s МСК, до тех пор повторять бесполезно",
+		return fmt.Errorf("the person is held by a row of running campaign %d %q, but the queue is stalled outside the send window: "+
+			"the row will not move before %s MSK, retrying until then is useless",
 			hold.id, hold.title, hold.queueOpensAt.In(moscowZone).Format("02.01 15:04"))
 	case "stopped":
-		// Кампанию со сломанным шаблоном start не продолжает - тот же рубеж, что
-		// стоит у идущей, - и совет «продолжите через start» упёрся бы в отказ.
-		// Выход остаётся один: снять её вместе с очередью.
+		// start does not resume a campaign with a broken template - the same guard
+		// that stands for a running one - and the advice "resume with start" would
+		// run into a refusal. One way out is left: remove it together with the queue.
 		if hold.broken {
-			return fmt.Errorf("человека держит строка кампании %d %q на паузе, а шаблон этой кампании не разобран: "+
-				"start её не продолжит, и сама она не разберётся - снимите её вместе с очередью через stop с cancel; "+
-				"cancel бьёт по кампаниям в порядке active, draft, stopped, поэтому при живой активной кампании или черновике зовите его повторно, пока очередь не дойдёт до кампании %d",
+			return fmt.Errorf("the person is held by a row of paused campaign %d %q, and the campaign's template could not be parsed: "+
+				"start will not resume it, and it will not sort itself out - remove it together with its queue with stop and cancel; "+
+				"cancel hits campaigns in the order active, draft, stopped, so with a live active campaign or a draft call it again until the queue reaches campaign %d",
 				hold.id, hold.title, hold.id)
 		}
-		return fmt.Errorf("человека держит строка кампании %d %q на паузе, и сама она не разберётся: "+
-			"продолжите кампанию через start либо снимите её вместе с очередью через stop с cancel - "+
-			"cancel бьёт по кампаниям в порядке active, draft, stopped, поэтому при живой активной кампании или черновике зовите его повторно, пока очередь не дойдёт до кампании %d",
+		return fmt.Errorf("the person is held by a row of paused campaign %d %q, and it will not sort itself out: "+
+			"resume the campaign with start, or remove it together with its queue with stop and cancel - "+
+			"cancel hits campaigns in the order active, draft, stopped, so with a live active campaign or a draft call it again until the queue reaches campaign %d",
 			hold.id, hold.title, hold.id)
 	default:
-		return fmt.Errorf("человека держит строка кампании %d %q, она уже закрыта (%s), но строку прямо сейчас несёт отправщик: "+
-			"действия по ней нет - он закроет её сам, а брошенный claim протухает не дольше чем за %d минут",
+		return fmt.Errorf("the person is held by a row of campaign %d %q, which is already closed (%s), but the sender is carrying the row right now: "+
+			"there is no action on it - the sender will close it itself, and an abandoned claim goes stale in no more than %d minutes",
 			hold.id, hold.title, hold.status, minutesUp(hold.staleAfter))
 	}
 }
 
-// accountStopError следует причине стопа. Ограничение Telegram снимает человек
-// через resume_account после проверки аккаунта, а отозванную сессию тот же совет
-// водит по кругу: стоп снят, демон получил ту же ошибку, стоп встал обратно.
-// Выход из отозванной сессии один - повторный вход подкомандой authorize.
+// accountStopError follows the reason of the stop. A Telegram restriction is
+// cleared by a human with resume_account after checking the account, but for a
+// revoked session the same advice goes in circles: the stop is cleared, the
+// daemon gets the same error, the stop is set again. There is one way out of a
+// revoked session - signing in again with the authorize subcommand.
 func accountStopError(err error) error {
 	var stop *accountStop
 	if !errors.As(err, &stop) {
-		return errors.New("аккаунт остановлен: проверьте его руками, потом снимите стоп через resume_account")
+		return errors.New("the account is stopped: check it by hand, then clear the stop with resume_account")
 	}
 	if stop.reason == telegram.KindAuthForbidden {
-		return fmt.Errorf("аккаунт остановлен: сессия Telegram больше не авторизована (%s). "+
-			"resume_account тут не поможет - стоп встанет снова; войдите заново подкомандой authorize (docs/first-launch.md), потом снимите стоп",
+		return fmt.Errorf("the account is stopped: the Telegram session is no longer authorized (%s). "+
+			"resume_account will not help here - the stop will be set again; sign in again with the authorize subcommand (docs/first-launch.md), then clear the stop",
 			stop.reason)
 	}
-	return fmt.Errorf("аккаунт остановлен ограничением Telegram (%s): проверьте его руками, потом снимите стоп через resume_account",
+	return fmt.Errorf("the account is stopped by a Telegram restriction (%s): check it by hand, then clear the stop with resume_account",
 		stop.reason)
 }
 
-// waitMinutes - сколько минут ещё считать доставку прошлого касания
-// неизвестной. Срок задан настройкой сервиса, поэтому едет внутри ошибки.
+// waitMinutes is how many more minutes the delivery of the previous touch is
+// still counted as unknown. The period is set by a service setting, so it
+// travels inside the error.
 func waitMinutes(err error) int {
 	var pending *pendingWait
 	if !errors.As(err, &pending) {
@@ -820,8 +835,8 @@ func waitMinutes(err error) int {
 	return minutesUp(pending.left)
 }
 
-// minutesUp - срок в минутах с округлением вверх: совет «подождите 0 минут»
-// разрешает повтор сразу.
+// minutesUp is a period in minutes rounded up: the advice "wait 0 minutes"
+// would allow an immediate retry.
 func minutesUp(left time.Duration) int {
 	value := int((left + time.Minute - time.Nanosecond) / time.Minute)
 	if value < 1 {
@@ -830,32 +845,32 @@ func minutesUp(left time.Duration) int {
 	return value
 }
 
-// telegramError переводит отказ Telegram в решение вызывающего. Код MTProto
-// идёт в текст: без него агент видит «временная ошибка Telegram», из чего не
-// следует ни повтора, ни отказа.
+// telegramError translates a Telegram refusal into a decision for the caller.
+// The MTProto code goes into the text: without it the agent sees "temporary
+// Telegram error", which implies neither a retry nor a refusal.
 func telegramError(failure *telegram.Failure) error {
 	switch failure.Kind {
 	case telegram.KindNotReady:
-		return withCode("сессия Telegram ещё не поднята, повторите через несколько секунд; если держится - смотрите make live-logs", failure)
+		return withCode("the Telegram session is not up yet, retry in a few seconds; if it persists, see make live-logs", failure)
 	case telegram.KindPeerForbidden:
-		return withCode("личка закрыта, ник не существует или нас заблокировали", failure)
+		return withCode("direct messages are closed, the username does not exist, or we are blocked", failure)
 	case telegram.KindNotPerson:
-		return withCode("ник занят группой или каналом: писать сервис умеет только человеку. Список диалогов их показывает, но отправка туда закрыта рубежом", failure)
+		return withCode("the username belongs to a group or channel: the service writes only to people. The dialog list shows them, but sending there is closed by a guard", failure)
 	case telegram.KindFloodWait:
-		// Длинный FLOOD_WAIT сюда не доходит: он останавливает аккаунт, и tg_send
-		// отвечает стопом. Здесь остаётся короткая пауза, которую и правда можно
-		// переждать, - об этом сказано прямо, иначе агент ждёт, повторяет и
-		// получает «аккаунт остановлен».
+		// A long FLOOD_WAIT does not get here: it stops the account, and tg_send
+		// answers with the stop. What remains is a short pause that can really be
+		// waited out - it is said outright, otherwise the agent waits, retries and
+		// gets "account stopped".
 		if failure.RetryAt.IsZero() {
-			return withCode("Telegram просит переждать и повторить, аккаунт не остановлен", failure)
+			return withCode("Telegram asks to wait and retry, the account is not stopped", failure)
 		}
-		return withCode(fmt.Sprintf("Telegram просит переждать до %s МСК и повторить, аккаунт не остановлен",
+		return withCode(fmt.Sprintf("Telegram asks to wait until %s MSK and retry, the account is not stopped",
 			failure.RetryAt.In(moscowZone).Format("15:04")), failure)
 	case telegram.KindPeerFlood:
-		return withCode("аккаунт ограничен в письмах незнакомым: отправка с него остановлена и снимается только resume_account после проверки человеком", failure)
+		return withCode("the account is restricted from messaging strangers: sending from it is stopped and is cleared only by resume_account after a human check", failure)
 	case telegram.KindBadRequest:
-		return withCode("Telegram отверг сам запрос: повтор того же даст тот же отказ. "+
-			"Сообщение не создано - поправьте текст (слишком длинный или пустой) либо запрос поиска и позовите инструмент заново", failure)
+		return withCode("Telegram rejected the request itself: repeating it gets the same refusal. "+
+			"No message was created - fix the text (too long or empty) or the search query and call the tool again", failure)
 	default:
 		return failure
 	}
@@ -865,42 +880,42 @@ func withCode(text string, failure *telegram.Failure) error {
 	if failure.Type == "" {
 		return errors.New(text)
 	}
-	return fmt.Errorf("%s (Telegram ответил %s)", text, failure.Type)
+	return fmt.Errorf("%s (Telegram answered %s)", text, failure.Type)
 }
 
 func textResult(text string) (*mcp.CallToolResult, any, error) {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, nil, nil
 }
 
-// stateOrder задаёт порядок счётчиков в ответе: по map порядок случайный, и
-// два вызова подряд выглядели бы как разные отчёты.
+// stateOrder fixes the order of counters in the answer: map order is random,
+// and two calls in a row would look like different reports.
 var stateOrder = []string{"planned", "sent", "replied", "undelivered", "skipped", "cancelled"}
 
 var stateLabels = map[string]string{
-	"planned":     "в очереди",
-	"sent":        "отправлено",
-	"replied":     "ответили",
-	"undelivered": "не доставлено",
-	"skipped":     "снято рубежом",
-	"cancelled":   "отменено",
+	"planned":     "queued",
+	"sent":        "sent",
+	"replied":     "replied",
+	"undelivered": "undelivered",
+	"skipped":     "removed by a guard",
+	"cancelled":   "cancelled",
 }
 
 var reasonLabels = map[string]string{
-	ReasonBadContact:   "нет id контакта amoCRM",
-	ReasonNoUsername:   "нет пригодного ника Telegram",
-	ReasonNoName:       "нет имени (кампании до 07.09.2026, сейчас письмо уходит без обращения)",
-	ReasonWroteFirst:   "написал сам до того, как до него дошла очередь",
-	ReasonTextTooLong:  "письмо с его именем длиннее предела Telegram",
-	ReasonNameBraces:   "в имени фигурная скобка, она уедет в письмо",
-	ReasonDuplicate:    "дубль: уже в кампании или дважды в пачке",
-	ReasonStopList:     "стоп-лист",
-	ReasonAlreadySent:  "уже получал сообщение",
-	ReasonCampaignGone: "кампания отменена",
-	ReasonNotAllowed:   "вне dev allow-list",
-	// Две причины вместо одной: отчёт не имеет права утверждать доставку там,
-	// где сервис её не знает.
-	ReasonDirectSent:    "уже писали руками через tg_send",
-	ReasonDirectPending: "писали руками, доставка неизвестна",
+	ReasonBadContact:   "no amoCRM contact id",
+	ReasonNoUsername:   "no usable Telegram username",
+	ReasonNoName:       "no name (campaigns before 07.09.2026; now the message goes out with no form of address)",
+	ReasonWroteFirst:   "wrote first, before their turn in the queue came",
+	ReasonTextTooLong:  "the message with their name is longer than the Telegram limit",
+	ReasonNameBraces:   "the name contains a curly brace, which would end up in the message",
+	ReasonDuplicate:    "duplicate: already in the campaign or twice in the batch",
+	ReasonStopList:     "stop list",
+	ReasonAlreadySent:  "already received a message",
+	ReasonCampaignGone: "campaign cancelled",
+	ReasonNotAllowed:   "outside the dev allow list",
+	// Two reasons instead of one: the report may not claim delivery where the
+	// service does not know it.
+	ReasonDirectSent:    "already messaged by hand through tg_send",
+	ReasonDirectPending: "messaged by hand, delivery unknown",
 }
 
 func label(labels map[string]string, key string) string {
@@ -921,7 +936,7 @@ func writeSkipped(text *strings.Builder, skipped map[string]int) {
 		return
 	}
 	sort.Strings(reasons)
-	text.WriteString("Отсев:\n")
+	text.WriteString("Screened out:\n")
 	for _, reason := range reasons {
 		fmt.Fprintf(text, "  %s: %d\n", label(reasonLabels, reason), skipped[reason])
 	}
@@ -929,60 +944,62 @@ func writeSkipped(text *strings.Builder, skipped map[string]int) {
 
 func writeCampaign(text *strings.Builder, status StatusReport) {
 	if status.Campaign == nil {
-		text.WriteString("Кампаний нет: начните с load_campaign.\n")
+		text.WriteString("No campaigns: start with load_campaign.\n")
 		return
 	}
-	fmt.Fprintf(text, "Кампания: %s (id %d), статус %s.\n",
+	fmt.Fprintf(text, "Campaign: %s (id %d), status %s.\n",
 		status.Campaign.Title, status.Campaign.ID, status.Campaign.Status)
-	fmt.Fprintf(text, "Строк всего: %d", status.Campaign.Total)
+	fmt.Fprintf(text, "Rows total: %d", status.Campaign.Total)
 	for _, state := range stateOrder {
 		if count := status.Campaign.States[state]; count > 0 {
 			fmt.Fprintf(text, ", %s %d", label(stateLabels, state), count)
 		}
 	}
 	text.WriteString("\n")
-	// Сломанный шаблон - причина простоя, а не состояние кампании: статус её
-	// остаётся тем, каким его оставил человек, поэтому очередь стоит молча, и
-	// сказать об этом обязана именно эта строка.
+	// A broken template is a cause of idling, not a campaign state: the status
+	// stays what the person left it, so the queue stands silently, and this very
+	// line has to say so.
 	if len(status.Idle.Braces) > 0 {
-		fmt.Fprintf(text, "Шаблон этой кампании не разобран (%q): отправки по ней не будет. "+
-			"Соберите кампанию заново через load_campaign и add_recipients",
+		fmt.Fprintf(text, "This campaign's template could not be parsed (%q): nothing will be sent for it. "+
+			"Rebuild the campaign with load_campaign and add_recipients",
 			status.Idle.Braces[0])
-		// Снимать через stop советуется только живой кампании: по закрытой stop
-		// откажет - снимать нечего, и совет отправил бы человека за отказом.
+		// Removing through stop is advised only for a live campaign: on a closed
+		// one stop refuses - nothing to remove, and the advice would send the
+		// person after a refusal.
 		switch status.Campaign.Status {
 		case "active", "draft", "stopped":
-			text.WriteString(", негодную снимите через stop с cancel")
+			text.WriteString(", remove the broken one with stop and cancel")
 		}
 		text.WriteString(".\n")
 	}
-	// Строка, однажды взятая аккаунтом, остаётся за ним навсегда, поэтому при
-	// нескольких отправщиках закреплённые строки - обычный ход рассылки, а не
-	// сигнал. Тревожен только случай, когда держит их аккаунт, который сейчас
-	// не отправляет: раньше других он и не встречался.
+	// A row once taken by an account stays with it for good, so with several
+	// senders pinned rows are the normal course of a mailing, not a signal. Only
+	// the case where an account that is not sending now holds them is alarming:
+	// there is no other account that would not meet them earlier.
 	for _, held := range status.Held {
 		if heldStalled(status, held.Label) {
-			fmt.Fprintf(text, "Закреплено за аккаунтом %s: %d строк - их возьмёт только он, а он сейчас не отправляет.\n",
+			fmt.Fprintf(text, "Pinned to account %s: %d rows - only it will take them, and it is not sending now.\n",
 				held.Label, held.Rows)
 			continue
 		}
-		fmt.Fprintf(text, "Закреплено за аккаунтом %s: %d строк - он их и отправит своим чередом.\n",
+		fmt.Fprintf(text, "Pinned to account %s: %d rows - it will send them in its own time.\n",
 			held.Label, held.Rows)
 	}
 	if status.Draft != nil {
-		fmt.Fprintf(text, "Есть черновик (id %d): %d строк, он не запущен.\n",
+		fmt.Fprintf(text, "There is a draft (id %d): %d rows, not started.\n",
 			status.Draft.ID, status.Draft.Rows)
 	}
 	if status.Paused != nil {
-		fmt.Fprintf(text, "На паузе кампания (id %d): %d строк, она возобновима.\n",
+		fmt.Fprintf(text, "A campaign is paused (id %d): %d rows, it can be resumed.\n",
 			status.Paused.ID, status.Paused.Rows)
 	}
 }
 
-// writeIdle называет простой очереди словами: кампания при этом active, строки
-// стоят planned, и такая картина неотличима от исправной работы - причину видно
-// только косвенно, по счётчику расхода или по границам окна. Числа идут в самой
-// строке: «потолок израсходован» без «7 из 7» проверить нечем.
+// writeIdle names a queue idle in words: the campaign is active, the rows stand
+// planned, and such a picture is indistinguishable from healthy work - the
+// reason is visible only indirectly, from the spend counter or the window
+// bounds. The numbers go in the line itself: "cap used up" without "7 of 7"
+// has nothing to check against.
 func writeIdle(text *strings.Builder, status StatusReport) {
 	body := idleBody(status.Idle, status)
 	if body == "" {
@@ -991,9 +1008,10 @@ func writeIdle(text *strings.Builder, status StatusReport) {
 	fmt.Fprintf(text, "%s: %s\n", idleLead(status.Idle.Reason), body)
 }
 
-// heldStalled - держит ли закреплённые строки аккаунт, который сейчас не
-// отправляет: его нет среди аккаунтов вовсе либо он остановлен. Живой сосед с
-// теми же строками - штатная картина рассылки с нескольких аккаунтов.
+// heldStalled reports whether the account holding the pinned rows is not
+// sending now: it is absent from the accounts altogether or it is stopped. A
+// live neighbour with the same rows is the normal picture of a mailing from
+// several accounts.
 func heldStalled(status StatusReport, label string) bool {
 	for _, item := range status.Accounts {
 		if item.Label == label {
@@ -1003,68 +1021,69 @@ func heldStalled(status StatusReport, label string) bool {
 	return true
 }
 
-// idleLead - чем открывается строка простоя: пустая очередь и занятый отправщик
-// не «стоят», и одно слово на все причины врало бы в двух случаях из девяти.
+// idleLead is what opens the idle line: an empty queue and a busy sender do not
+// "stand", and one word for all the reasons would lie in two cases out of nine.
 func idleLead(reason string) string {
 	switch reason {
 	case IdleQueueEmpty:
-		return "Очередь пуста"
+		return "Queue is empty"
 	case IdleClaimRaceLost:
-		return "Очередь движется"
+		return "Queue is moving"
 	default:
-		return "Очередь стоит"
+		return "Queue is stalled"
 	}
 }
 
-// idleBody - причина простоя словами. Одна формулировка на два места: общую
-// строку отчёта и строку аккаунта, которая нужна там, где отправщиков несколько
-// и молчит только один из них. Пустая строка означает, что причина уже названа
-// рядом и повторять её нечем.
+// idleBody is the reason for the idle in words. One wording serves two places:
+// the general report line and the account line, which is needed where there are
+// several senders and only one of them is quiet. An empty string means the
+// reason is already named nearby and there is nothing to repeat.
 func idleBody(idle Idle, status StatusReport) string {
 	switch idle.Reason {
 	case IdleWindowClosed:
 		if idle.OpensAt.IsZero() {
-			return "окно отправки закрыто."
+			return "the send window is closed."
 		}
-		return fmt.Sprintf("окно отправки закрыто, ближайшее открытие %s МСК.",
+		return fmt.Sprintf("the send window is closed, next opening %s MSK.",
 			idle.OpensAt.In(moscowZone).Format("02.01 15:04"))
 	case IdleAccountStop:
-		return "аккаунт остановлен, снимает стоп только resume_account после проверки человеком."
+		return "the account is stopped, only resume_account clears the stop, after a human check."
 	case IdleDailyLimit:
-		return fmt.Sprintf("дневной потолок аккаунта израсходован (%d из %d), отправка продолжится завтра в окно.",
+		return fmt.Sprintf("the account's daily cap is used up (%d of %d), sending resumes tomorrow in the window.",
 			idle.Used, idle.Limit)
 	case IdleNoCampaign:
-		// Совет звать start даётся только там, где есть что запускать: в пустой
-		// системе строка выше уже сказала «кампаний нет», а по закрытой кампании
-		// start откажет. Заметок Draft и Paused одних не хватает: StatusOf
-		// заполняет их только когда показана не та же кампания, и единственный
-		// черновик остался бы без совета.
+		// The advice to call start is given only where there is something to
+		// start: in an empty system the line above already said "no campaigns",
+		// and on a closed campaign start refuses. The Draft and Paused notes alone
+		// are not enough: StatusOf fills them only when a different campaign is
+		// shown, and a lone draft would be left without advice.
 		shown := status.Campaign != nil &&
 			(status.Campaign.Status == "draft" || status.Campaign.Status == "stopped")
 		switch {
 		case shown || status.Draft != nil || status.Paused != nil:
-			return "идущей кампании нет - запустите её через start."
+			return "no campaign is running - launch one with start."
 		case status.Campaign != nil:
-			return "кампания закрыта, новую создаёт load_campaign."
+			return "the campaign is closed; load_campaign creates a new one."
 		}
 		return ""
 	case IdleBrokenTemplate:
-		// Скобки показанной кампании уже названы строкой выше вместе с советом;
-		// эта строка нужна там, где отчёт идёт по другой кампании.
+		// The braces of the shown campaign are already named by the line above,
+		// together with the advice; this line is needed where the report is about
+		// another campaign.
 		if len(status.Idle.Braces) == 0 {
-			return "шаблон идущей кампании не разобран, отправки по ней не будет."
+			return "the template of the running campaign could not be parsed, nothing will be sent for it."
 		}
 		return ""
 	case IdleQueueEmpty:
-		return "строк в работе не осталось."
+		return "no rows left in work."
 	case IdleQueueBlocked:
-		return "оставшиеся строки закреплены за другим аккаунтом, их возьмёт только он."
+		return "the remaining rows are pinned to another account, only it will take them."
 	case IdleQueueDisqualified:
-		return fmt.Sprintf("все оставшиеся строки (%d) снимает рубеж - стоп-лист, уже писали или негодное имя. "+
-			"Отправок по этой кампании больше не будет, ближайший виток закроет её; разбор по строкам покажет status с full.",
+		return fmt.Sprintf("a guard removes all the remaining rows (%d) - stop list, already messaged, or an unusable name. "+
+			"Nothing more will be sent for this campaign, the next sender cycle will close it; status with full shows the per-row breakdown.",
 			idle.Left)
 	case IdleClaimRaceLost:
-		return "доступные строки есть, отправщик берёт их по одной с паузами."
+		return "rows are available, the sender takes them one at a time with pauses."
 	}
 	return ""
 }
@@ -1073,96 +1092,98 @@ func writePreview(text *strings.Builder, status StatusReport) {
 	if len(status.Preview) == 0 || status.Campaign == nil {
 		return
 	}
-	// Превью упирается в потолок показа: без числа строк кампании три строки
-	// читаются как весь список. Там, где среза нет, оговорки тоже нет - «первые 2
-	// из 2» заставляет искать несуществующий остаток.
+	// The preview hits the display cap: without the campaign's row count, three
+	// rows read as the whole list. Where there is no cut, there is no caveat
+	// either - "first 2 of 2" makes one look for a remainder that does not exist.
 	if len(status.Preview) < status.Campaign.Total {
-		fmt.Fprintf(text, "Превью сообщений (первые %d из %d):\n", len(status.Preview), status.Campaign.Total)
+		fmt.Fprintf(text, "Message preview (first %d of %d):\n", len(status.Preview), status.Campaign.Total)
 	} else {
-		fmt.Fprintf(text, "Превью сообщений (%d):\n", len(status.Preview))
+		fmt.Fprintf(text, "Message preview (%d):\n", len(status.Preview))
 	}
-	// Текст сокращается тем же приёмом, что и реплика в списке диалогов: превью
-	// показывает подстановку, а не пересказывает письмо целиком.
+	// The text is shortened the same way as a reply in the dialog list: the
+	// preview shows the substitution, it does not retell the whole message.
 	for _, item := range status.Preview {
 		fmt.Fprintf(text, "  @%s: %s\n", item.Username, shorten(item.Text))
 	}
 }
 
-// writeAccounts печатает расход аккаунта тем же числом, каким его считает рубеж:
-// UsedToday собран одним usedTodaySQL и уже включает первые касания руками, а
-// они названы отдельной строкой - человеку нужно видеть, чем израсходован
-// потолок. Тёплые реплики и служебные адресаты в потолок не входят и стоят
-// особняком, иначе строка отчёта обещала бы запас там, где tg_send уже
-// отказывает.
+// writeAccounts prints the account's spend with the same number the guard
+// counts: UsedToday is built by one usedTodaySQL and already includes first
+// touches by hand, which are named on a separate line - the person needs to see
+// what the cap was spent on. Warm replies and service recipients do not count
+// toward the cap and stand apart, otherwise the report line would promise
+// headroom where tg_send already refuses.
 func writeAccounts(text *strings.Builder, status StatusReport) {
 	if len(status.Accounts) > 0 {
-		text.WriteString("Аккаунты:\n")
+		text.WriteString("Accounts:\n")
 		for _, item := range status.Accounts {
-			fmt.Fprintf(text, "  %s: сегодня %d из %d (потолок из БД, с учётом строк в работе",
+			fmt.Fprintf(text, "  %s: today %d of %d (cap from the database, counting rows in work",
 				item.Label, item.UsedToday, item.DailyLimit)
 			if item.ColdToday > 0 {
-				fmt.Fprintf(text, ", из них первых касаний руками: %d", item.ColdToday)
+				fmt.Fprintf(text, ", of them first touches by hand: %d", item.ColdToday)
 			}
 			text.WriteString(")")
 			if item.WarmToday > 0 {
-				fmt.Fprintf(text, ", тёплых ответов сегодня: %d (в потолок не входят)", item.WarmToday)
+				fmt.Fprintf(text, ", warm replies today: %d (not counted toward the cap)", item.WarmToday)
 			}
 			if item.OwnerToday > 0 {
-				fmt.Fprintf(text, ", служебных адресатов сегодня: %d (в потолок не входят)", item.OwnerToday)
+				fmt.Fprintf(text, ", service recipients today: %d (not counted toward the cap)", item.OwnerToday)
 			}
 			if item.Stopped {
-				fmt.Fprintf(text, ", ОСТАНОВЛЕН (%s), снимается только resume_account", item.StopReason)
+				fmt.Fprintf(text, ", STOPPED (%s), cleared only by resume_account", item.StopReason)
 			}
-			// Причина молчания идёт в строку аккаунта только тогда, когда общей
-			// строки нет: отправщиков несколько и молчат они по разным причинам.
-			// У остановленного её не печатаем - о стопе сказано здесь же.
+			// The reason for the silence goes into the account line only when there
+			// is no general line: there are several senders and they are quiet for
+			// different reasons. For a stopped account it is not printed - the stop
+			// is mentioned right here.
 			if status.Idle.Reason == "" && item.Idle.Reason != IdleAccountStop {
 				if body := idleBody(item.Idle, status); body != "" {
-					fmt.Fprintf(text, ", молчит: %s", strings.TrimSuffix(body, "."))
+					fmt.Fprintf(text, ", quiet: %s", strings.TrimSuffix(body, "."))
 				}
 			}
 			text.WriteString("\n")
 		}
 	}
-	// Список служебных адресатов называется поимённо и всегда, а не только когда
-	// им сегодня писали: для этих ников выключены окно, потолок и правило «одно
-	// сообщение», и лишний ник в нём иначе обнаружился бы только ушедшим
-	// сообщением.
+	// The list of service recipients is named by username and always, not only
+	// when someone was written to today: the window, the cap and the one-message
+	// rule are off for these usernames, and an extra username in it would
+	// otherwise be discovered only by a message that went out.
 	if len(status.Owners) > 0 {
-		text.WriteString("Служебные адресаты (окно, потолок и правило «одно сообщение» на них не действуют):")
+		text.WriteString("Service recipients (the window, the cap and the one-message rule do not apply to them):")
 		for _, name := range status.Owners {
 			fmt.Fprintf(text, " @%s", name)
 		}
 		text.WriteString("\n")
 	}
-	// Зависшая строка журнала закрывает человека навсегда, а доставка
-	// неизвестна: чинится руками, поэтому обязана попадаться на глаза.
+	// A stuck journal row closes the person for good, and delivery is unknown:
+	// it is fixed by hand, so it must catch the eye.
 	if status.StuckDirect > 0 {
-		fmt.Fprintf(text, "Ручных касаний с неизвестной доставкой: %d\n", status.StuckDirect)
+		fmt.Fprintf(text, "Manual touches with unknown delivery: %d\n", status.StuckDirect)
 	}
-	// Строка с протухшим claim у кампании на паузе сама не чинится: она держит
-	// человека закрытым и для рассылки, и для tg_send.
+	// A row with a stale claim in a paused campaign does not fix itself: it keeps
+	// the person closed to both the mailing and tg_send.
 	if status.StuckClaims > 0 {
-		fmt.Fprintf(text, "Строк с зависшим claim: %d\n", status.StuckClaims)
+		fmt.Fprintf(text, "Rows with a stuck claim: %d\n", status.StuckClaims)
 	}
 }
 
-// writeContacts печатает находки поиска. needle - запрос в том же виде, в каком
-// его искал Telegram: без @, без пробелов по краям и в нижнем регистре.
+// writeContacts prints the search results. needle is the query in the form
+// Telegram searched with: no @, no surrounding spaces, lowercase.
 func writeContacts(text *strings.Builder, needle string, found []Contact) {
 	byUsername := telegram.IsUsername(needle)
 	if len(found) == 0 {
 		if byUsername {
-			fmt.Fprintf(text, "Ника @%s нет и похожих не нашлось.\nДальше: проверьте ник на опечатку либо поищите человека по имени.\n", needle)
+			fmt.Fprintf(text, "There is no @%s and no similar usernames were found.\nNext: check the username for a typo, or search for the person by name.\n", needle)
 			return
 		}
-		fmt.Fprintf(text, "По запросу %q никого не нашлось.\nДальше: назовите точный ник без @ либо поищите человека по другому написанию имени.\n", needle)
+		fmt.Fprintf(text, "Nobody was found for the query %q.\nNext: give an exact username without @, or search for the person by another spelling of the name.\n", needle)
 		return
 	}
 
-	// Точный ник переставляется в голову списка: в префиксной выдаче тот, кого
-	// искали, стоит вперемешку с чужими похожими никами и теряется. Находка одна
-	// - ник в Telegram уникален, - поэтому порядок остальных не меняется.
+	// The exact username is moved to the head of the list: in a prefix result the
+	// one being looked for sits among other people's similar usernames and gets
+	// lost. There is one match - a Telegram username is unique - so the order of
+	// the rest does not change.
 	list := found
 	exact := -1
 	for i, item := range found {
@@ -1178,46 +1199,48 @@ func writeContacts(text *strings.Builder, needle string, found []Contact) {
 		list = append(list, found[exact+1:]...)
 	}
 
-	fmt.Fprintf(text, "Найдено по запросу %q: %d\n", needle, len(list))
-	// Про список, а не про Telegram: при полном лимите похожих точный ник не
-	// проверялся вовсе, и «в Telegram такого ника нет» было бы обещанием, за
-	// которое отчёт не отвечает.
+	fmt.Fprintf(text, "Found for the query %q: %d\n", needle, len(list))
+	// This is about the list, not about Telegram: when the limit of similar
+	// usernames is full, the exact one was not checked at all, and "there is no
+	// such username in Telegram" would be a promise the report does not stand
+	// behind.
 	if byUsername && exact < 0 {
-		fmt.Fprintf(text, "Среди найденных точного ника @%s нет: ниже похожие ники, это другие люди. "+
-			"tg_send по ним - только после проверки, что ник взят не с опечаткой.\n", needle)
+		fmt.Fprintf(text, "None of the results is the exact username @%s: the usernames below are similar, and they are other people. "+
+			"Use tg_send on them only after checking that the username was not taken with a typo.\n", needle)
 	}
 	for _, item := range list {
 		fmt.Fprintf(text, "  %s", personHead(item.Username, item.Name))
 		if item.Exact {
-			text.WriteString(" - точный ник")
+			text.WriteString(" - exact username")
 		}
-		// Про диалог строка молчит намеренно: сервис знает только, встречался ли
-		// адрес раньше, а туда же кладёт ник обычный резолв под tg_read. Обещав
-		// диалог, отчёт заставил бы планировать ответ как тёплый и получить
-		// отказ по окну.
-		// Адресная книга сильнее «адрес встречался»: человек из контактов почти
-		// всегда знакомый, и обратный порядок веток не давал бы этой строке
-		// появиться вовсе - у локальной находки Known стоит всегда.
+		// The line is silent about the dialog on purpose: the service knows only
+		// whether the address was seen before, and the plain resolve under tg_read
+		// puts the username there too. By promising a dialog, the report would
+		// make one plan the reply as a warm one and get a refusal on the window.
+		// The address book outranks "address was seen": a person from the contacts
+		// is almost always an acquaintance, and the reverse order of branches would
+		// never let this line appear - Known is always set for a local find.
 		switch {
 		case item.IsContact:
-			text.WriteString(" - в контактах")
+			text.WriteString(" - in contacts")
 		case item.Known:
-			text.WriteString(" - ник уже встречался")
+			text.WriteString(" - username seen before")
 		default:
-			text.WriteString(" - сервису незнаком")
+			text.WriteString(" - unknown to the service")
 		}
 		if item.Username == "" {
 			text.WriteString(noUsernameNote)
 		}
 		text.WriteString("\n")
 	}
-	text.WriteString("Дальше: tg_read покажет диалог, tg_send напишет. " +
-		"Тёплая это переписка или первое касание, решает отправка: первое касание уходит только в окно и в потолок.\n")
+	text.WriteString("Next: tg_read shows the dialog, tg_send writes. " +
+		"Whether this is a warm conversation or a first touch is decided at sending: a first touch goes out only in the window and counts toward the cap.\n")
 }
 
-// personHead - человек в начале строки списка. Ник по имени не угадывается
-// (инвариант 5), поэтому у человека без публичного ника печатается имя, а не
-// пустой @: пустой @ агент принимает за ник и подставляет его в tg_send.
+// personHead is the person at the start of a list line. A username cannot be
+// guessed from a name (invariant 5), so a person without a public username is
+// printed by name, not with an empty @: an empty @ is taken by the agent for a
+// username and substituted into tg_send.
 func personHead(username, name string) string {
 	switch {
 	case username != "" && name != "":
@@ -1227,109 +1250,114 @@ func personHead(username, name string) string {
 	case name != "":
 		return name
 	default:
-		return "без имени и ника"
+		return noNameOrUsername
 	}
 }
 
-// noUsernameNote называет отсутствие ника прямо: рубеж tg_send такого человека
-// всё равно остановит, но разбор отказа обойдётся дороже, чем эта строка.
-const noUsernameNote = "; публичного ника нет, tg_send ему не напишет"
+// noNameOrUsername stands in for a person who has neither a name nor a username.
+const noNameOrUsername = "no name and no username"
 
-// writeConversation печатает диалог так, как его читает человек: от старых к
-// новым, чужое и своё названы словом, текст не обрезается - объём держит
-// depth. Имени собеседника и полного числа сообщений в заголовке нет: сервис
-// их не знает, а лишний запрос ради шапки не ставится.
+// noUsernameNote names the missing username outright: the tg_send guard stops
+// such a person anyway, but dissecting the refusal costs more than this line.
+const noUsernameNote = "; no public username, tg_send cannot message them"
+
+// writeConversation prints the dialog the way a person reads it: oldest to
+// newest, the other side and our side named in words, the text not truncated -
+// the volume is held by depth. The header has neither the interlocutor's name
+// nor the full message count: the service does not know them, and an extra
+// query for a header is not made.
 func writeConversation(text *strings.Builder, talk Conversation) {
-	fmt.Fprintf(text, "Диалог с @%s", talk.Username)
+	fmt.Fprintf(text, "Dialog with @%s", talk.Username)
 	if talk.UserID > 0 {
 		fmt.Fprintf(text, " (id %d)", talk.UserID)
 	}
 	if len(talk.Messages) == 0 {
-		text.WriteString(": сообщений нет.\n")
+		text.WriteString(": no messages.\n")
 	} else {
-		fmt.Fprintf(text, ", последние сообщения (%d):\n", len(talk.Messages))
+		fmt.Fprintf(text, ", latest messages (%d):\n", len(talk.Messages))
 		writeMessages(text, talk.Messages, false)
 	}
 
 	switch {
 	case len(talk.Fresh) > 0:
-		fmt.Fprintf(text, "Новое сообщение через %d секунд:\n", int(talk.Waited.Seconds()))
+		fmt.Fprintf(text, "New message after %d seconds:\n", int(talk.Waited.Seconds()))
 		writeMessages(text, talk.Fresh, false)
 	case talk.Waited > 0:
-		fmt.Fprintf(text, "Ждали %d секунд, реплики не было. Нужно ждать дальше - позовите tg_read ещё раз: "+
-			"ожидание продолжится с этого места.\n", int(talk.Waited.Seconds()))
+		fmt.Fprintf(text, "Waited %d seconds, no reply came. To wait longer, call tg_read again: "+
+			"the wait continues from this point.\n", int(talk.Waited.Seconds()))
 	default:
-		text.WriteString("Не ждали: без wait_seconds инструмент отвечает сразу.\n")
+		text.WriteString("Did not wait: without wait_seconds the tool answers at once.\n")
 	}
-	text.WriteString("Дальше: tg_send ответит в этот диалог, tg_read с wait_seconds подождёт реплику.\n")
+	text.WriteString("Next: tg_send replies into this dialog, tg_read with wait_seconds waits for a reply.\n")
 }
 
-// dialogKind называет вид строки по смыслу действия, а не по устройству
-// Telegram: супергруппа и обычная группа читаются одинаково - место, где
-// переписываются люди, - и обе называются группой; вещательный канал остаётся
-// каналом.
+// dialogKind names the kind of a row by the meaning of the action, not by the
+// way Telegram is built: a supergroup and a plain group read the same - a place
+// where people talk to each other - and both are called a group; a broadcast
+// channel stays a channel.
 func dialogKind(kind telegram.Kind, broadcast bool) string {
 	switch {
 	case kind == telegram.KindUser:
-		return "человек"
+		return "person"
 	case kind == telegram.KindChannel && broadcast:
-		return "канал"
+		return "channel"
 	case kind == telegram.KindChannel || kind == telegram.KindChat:
-		return "группа"
+		return "group"
 	default:
-		return "неизвестно"
+		return "unknown"
 	}
 }
 
 func writeDialogs(text *strings.Builder, list []DialogInfo) {
 	if len(list) == 0 {
-		// Отсева групп и каналов больше нет: список пуст, только если у аккаунта
-		// нет вовсе ни одного диалога.
-		text.WriteString("Диалогов нет ни одного - ни личных, ни групп, ни каналов.\nДальше: tg_find найдёт человека по нику, tg_send начнёт диалог.\n")
+		// Groups and channels are no longer filtered out: the list is empty only
+		// when the account has no dialogs at all.
+		text.WriteString("No dialogs at all - no private chats, no groups, no channels.\nNext: tg_find finds a person by username, tg_send starts a dialog.\n")
 		return
 	}
-	fmt.Fprintf(text, "Диалоги (%d):\n", len(list))
+	fmt.Fprintf(text, "Dialogs (%d):\n", len(list))
 	for _, item := range list {
 		kind, _, err := item.Ref.Split()
 		if err != nil {
-			// Испорченная ссылка не прячет строку: вид будет назван «неизвестно».
+			// A broken reference does not hide the row: its kind will be named "unknown".
 			kind = ""
 		}
 		person := kind == telegram.KindUser
 		head := personHead(item.Username, item.Name)
-		// Пустое имя у группы и канала значит, что сущности не было в ответе
-		// (аккаунт исключён), а не человека без ника: безымянных групп не бывает.
-		if !person && head == "без имени и ника" {
-			head = "название неизвестно"
+		// An empty name on a group or channel means the entity was not in the
+		// answer (the account was removed from it), not a person without a
+		// username: there are no unnamed groups.
+		if !person && head == noNameOrUsername {
+			head = "title unknown"
 		}
 		fmt.Fprintf(text, "  %s: %s", dialogKind(kind, item.Broadcast), head)
 		if item.Unread > 0 {
-			fmt.Fprintf(text, ", непрочитанных %d", item.Unread)
+			fmt.Fprintf(text, ", %d unread", item.Unread)
 		}
-		// Пустой ник у группы и супергруппы - устройство платформы, не пропажа:
-		// предупреждение про tg_send печатается только человеку.
+		// An empty username on a group or supergroup is how the platform works,
+		// not a loss: the warning about tg_send is printed only for a person.
 		if person && item.Username == "" {
 			text.WriteString(noUsernameNote)
 		}
 		text.WriteString("\n")
-		// Верхнее сообщение группы бывает служебным, и тогда его нет вовсе:
-		// строка «он: [без текста]» на пустом месте читается как потерянный текст.
+		// A group's top message may be a service one, and then there is none at
+		// all: a line "them: [no text]" out of nowhere reads as lost text.
 		if item.Last != (ChatMessage{}) {
 			writeMessages(text, []ChatMessage{item.Last}, true)
 		}
 	}
-	text.WriteString("Дальше: tg_read покажет диалог целиком. Написать можно только человеку - tg_send группе и каналу откажет рубежом.\n")
+	text.WriteString("Next: tg_read shows the whole dialog. Only a person can be written to - tg_send to a group or channel is refused by a guard.\n")
 }
 
-// snippetLen - потолок реплики в списке диалогов: пост канала на двадцать
-// строк вытесняет с экрана сам список, ради которого инструмент и звали.
+// snippetLen is the cap on a reply in the dialog list: a channel post of twenty
+// lines would push out of the screen the very list the tool was called for.
 const snippetLen = 100
 
-// writeMessages - строки диалога: время в МСК, направление словом, вложение
-// пометкой перед текстом. short схлопывает реплику в одну строку - так её
-// печатает список диалогов; чтение диалога отдаёт текст целиком, объём там
-// держит depth. Время у сообщения без даты (журнал dry-run) не печатается
-// вовсе: подставленная дата выглядела бы как настоящая.
+// writeMessages prints dialog rows: time in MSK, direction in words, an
+// attachment as a mark before the text. short collapses a reply into one line -
+// that is how the dialog list prints it; a dialog read returns the whole text,
+// and the volume is held by depth. The time of a message without a date (the
+// dry-run journal) is not printed at all: a substituted date would look real.
 func writeMessages(text *strings.Builder, messages []ChatMessage, short bool) {
 	for _, msg := range messages {
 		text.WriteString("  ")
@@ -1337,16 +1365,16 @@ func writeMessages(text *strings.Builder, messages []ChatMessage, short bool) {
 			fmt.Fprintf(text, "[%s] ", msg.SentAt.In(moscowZone).Format("02.01 15:04"))
 		}
 		if msg.Outgoing {
-			text.WriteString("мы: ")
+			text.WriteString("us: ")
 		} else {
-			text.WriteString("он: ")
+			text.WriteString("them: ")
 		}
 		body := msg.Text
 		if short {
 			body = shorten(body)
 		}
-		// Пустое сообщение без вложения (служебное или удалённый текст) читается
-		// как сломанная строка, поэтому названо словом.
+		// A message with no text and no attachment (a service one or a deleted
+		// text) reads as a broken line, so it is named in words.
 		switch {
 		case msg.MediaKind != "" && body != "":
 			fmt.Fprintf(text, "[%s] %s", msg.MediaKind, body)
@@ -1355,25 +1383,25 @@ func writeMessages(text *strings.Builder, messages []ChatMessage, short bool) {
 		case body != "":
 			text.WriteString(body)
 		default:
-			text.WriteString("[без текста]")
+			text.WriteString("[no text]")
 		}
 		text.WriteString("\n")
 	}
 }
 
-// shorten схлопывает реплику в одну строку и режет её по рунам: срез по байтам
-// порвал бы кириллицу или эмодзи посередине.
+// shorten collapses a reply into one line and cuts it by runes: a cut by bytes
+// would tear Cyrillic or an emoji in the middle.
 func shorten(body string) string {
 	return cutRunes(strings.Join(strings.Fields(body), " "), snippetLen)
 }
 
-// templateShown - сколько символов шаблона печатает load_campaign. Письмо читают
-// глазами целиком, поэтому потолок щедрый; режется только то, что вытеснило бы
-// из ответа всё остальное.
+// templateShown is how many characters of the template load_campaign prints.
+// The message is read by eye in full, so the cap is generous; only what would
+// push everything else out of the answer is cut.
 const templateShown = 500
 
-// cutRunes режет текст по рунам, не трогая переносы строк: шаблон проверяют как
-// письмо, и схлопнутый в строку он для этого не годится.
+// cutRunes cuts text by runes and leaves line breaks alone: the template is
+// checked as a message, and collapsed into one line it would be no good for that.
 func cutRunes(body string, limit int) string {
 	runes := []rune(body)
 	if len(runes) <= limit {
@@ -1383,7 +1411,7 @@ func cutRunes(body string, limit int) string {
 }
 
 func writeRows(text *strings.Builder, status StatusReport) {
-	fmt.Fprintf(text, "Получатели (%d):\n", len(status.Rows))
+	fmt.Fprintf(text, "Recipients (%d):\n", len(status.Rows))
 	for _, row := range status.Rows {
 		fmt.Fprintf(text, "  @%s %s - %s", row.Username, row.Name, label(stateLabels, row.State))
 		if row.Reason != "" {

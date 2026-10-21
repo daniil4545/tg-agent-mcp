@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Именованные операции над боевым контуром tg-agent-mcp вместо произвольного
-# SQL. Контур стоит на этой машине в Docker (docker-compose.local.yml), ssh
-# здесь нет; имя файла держит конвенцию портфеля: safe-ssh.sh - разрешённый
-# список действий, читающих по умолчанию и мутирующих только с «apply».
+# Named operations on the live tg-agent-mcp stack instead of arbitrary SQL.
+# The stack runs on this machine in Docker (docker-compose.local.yml), so there
+# is no ssh here; the file name keeps the usual convention: safe-ssh.sh is
+# an allow-list of actions that read by default and mutate only with "apply".
 #
-# Журнал касаний и строки кампаний правятся ТОЛЬКО для аккаунтов владельца:
-# они нужны для периодических проверок рассылки, и рубеж «один человек - одно
-# сообщение» для них снимается руками (решение владельца 06.09.2026). Любой
-# другой ник скрипт отвергает - это устройство команды, а не договорённость.
+# The touch log and campaign rows are edited ONLY for the owner's accounts:
+# they are needed for periodic checks of the mailing, and the "one person, one
+# message" guard is lifted for them by hand (owner's decision of 2026-09-06).
+# The script rejects any other username - this is how the command is built, not
+# an agreement.
 #
-# Список ниже шире DEV_ALLOW_LIST намеренно. DEV_ALLOW_LIST называет служебных
-# адресатов, которым сервис не считает окно и потолок; здесь перечислены все
-# аккаунты владельца, следы которых можно забывать. Аккаунт, проверяющий сами
-# рубежи, обязан быть вне DEV_ALLOW_LIST и при этом чиститься между прогонами.
+# The list below is deliberately wider than DEV_ALLOW_LIST. DEV_ALLOW_LIST
+# names service recipients for whom the service does not count the window and
+# the cap; here are all the owner's accounts whose traces may be forgotten. An
+# account that tests the guards themselves must be outside DEV_ALLOW_LIST and
+# still be cleaned between runs.
 set -euo pipefail
 
 owner_accounts=(smirnov dev_account daniilsukhar manager_one)
@@ -29,18 +31,19 @@ usage() {
 Usage: deploy/safe-ssh.sh <action> [args...]
 
 Read-only actions:
-  registry-owner            касания и строки кампаний по аккаунтам владельца
+  registry-owner            touches and campaign rows of the owner's accounts
 
 Mutating actions:
-  registry-forget <ник> apply   забыть следы аккаунта владельца: ручные касания
-                                помечаются failed, строки прошлых кампаний -
-                                cancelled. Отсев импорта и tg_send их больше не
-                                видят, история остаётся. Ник только из списка
-                                владельца.
-  account-limit <метка> <N> apply   дневной потолок аккаунта. Потолок живёт в
-                                базе: ACCOUNT_DAILY_LIMIT задаёт его только при
-                                первом заведении строки, и перезапуск с другой
-                                переменной его не меняет.
+  registry-forget <username> apply   forget the traces of an owner account:
+                                manual touches are marked failed, rows of past
+                                campaigns are marked cancelled. The import
+                                filter and tg_send no longer see them, the
+                                history stays. Only usernames from the owner
+                                list are accepted.
+  account-limit <label> <N> apply   daily cap of an account. The cap lives in
+                                the database: ACCOUNT_DAILY_LIMIT sets it only
+                                when the row is first created, and a restart
+                                with another value does not change it.
 USAGE
 }
 
@@ -68,17 +71,17 @@ case "$action" in
         arg="${arg#@}"
         arg="$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')"
         if [[ -z "$arg" || "$confirm" != "apply" ]]; then
-            echo "registry-forget requires: <ник> apply" >&2
+            echo "registry-forget requires: <username> apply" >&2
             exit 2
         fi
         if ! is_owner "$arg"; then
             echo "refusing: @$arg is not an owner account (${owner_accounts[*]})" >&2
             exit 2
         fi
-        # Строки не удаляются, а помечаются: индексы отсева и суточного счёта
-        # failed не видят, а история касаний остаётся для разбора. Строка
-        # кампании закрывается cancelled - отсев импорта считает человека
-        # получившим письмо и по sent, и по replied.
+        # Rows are not deleted but marked: the filter and daily-count indexes
+        # ignore failed rows, while the touch history stays for analysis. A
+        # campaign row is closed as cancelled - the import filter treats a
+        # person as having received a message in both sent and replied.
         "${psql[@]}" \
             -c "UPDATE direct_messages SET state = 'failed', reason = 'forgotten: owner account check' WHERE lower(username) = '$arg' AND state <> 'failed';" \
             -c "UPDATE recipients SET state = 'cancelled', reason = 'forgotten: owner account check' WHERE lower(username) = '$arg' AND state IN ('sent', 'replied');"
@@ -86,11 +89,11 @@ case "$action" in
     account-limit)
         limit="${3:-}"
         if [[ -z "$arg" || -z "$limit" || "${4:-}" != "apply" ]]; then
-            echo "account-limit requires: <метка> <N> apply" >&2
+            echo "account-limit requires: <label> <N> apply" >&2
             exit 2
         fi
         if ! [[ "$limit" =~ ^[0-9]+$ ]] || (( limit < 1 || limit > 40 )); then
-            echo "refusing: потолок вне разумных пределов 1..40: $limit" >&2
+            echo "refusing: cap outside the sane range 1..40: $limit" >&2
             exit 2
         fi
         "${psql[@]}" \

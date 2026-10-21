@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// Dev allow-list - последний рубеж: он стоит в транспорте, за всеми рубежами
-// БД, и человека вне списка не выпускает наружу даже с уже взятой строкой.
+// The dev allow-list is the last guard: it sits in the transport, behind all
+// the DB guards, and does not let a person outside the list out even with an already claimed row.
 func TestDevAllowList(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -19,26 +19,26 @@ func TestDevAllowList(t *testing.T) {
 	startWith(t, service, person(1, "allowed_one"), person(2, "stranger_one"))
 	for range 2 {
 		if err := sender.step(ctx); err != nil {
-			t.Fatalf("виток отправщика: %v", err)
+			t.Fatalf("sender iteration: %v", err)
 		}
 	}
 
 	sent := transport.Sent()
 	if len(sent) != 1 || sent[0].Username != "allowed_one" {
-		t.Fatalf("транспорт выпустил наружу %+v", sent)
+		t.Fatalf("transport let out %+v", sent)
 	}
 	if state, _ := recipientState(t, service.pool, "allowed_one"); state != "sent" {
-		t.Fatalf("разрешённый получатель в состоянии %q", state)
+		t.Fatalf("allowed recipient in state %q", state)
 	}
 	state, reason := recipientState(t, service.pool, "stranger_one")
 	if state != "undelivered" || reason != ReasonNotAllowed {
-		t.Fatalf("получатель вне списка в состоянии %q с причиной %q", state, reason)
+		t.Fatalf("recipient outside the list in state %q with reason %q", state, reason)
 	}
 }
 
-// Allow-list по-прежнему валит Resolve и кампанийную отправку постороннему -
-// защита от того, что ради работающего чтения кто-то снимет checkAllowed с
-// Resolve. Через Resolve идёт живая отправка, и рубеж на ней обязан остаться.
+// The allow-list still fails Resolve and the campaign send to an outsider -
+// protection against someone removing checkAllowed from Resolve to make
+// reading work. Live sending goes through Resolve, and the guard on it must stay.
 func TestAllowListStillHoldsCampaignSend(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -47,16 +47,16 @@ func TestAllowListStillHoldsCampaignSend(t *testing.T) {
 	transport := NewDryRunTransport(service.cfg)
 
 	if _, err := transport.Resolve(ctx, "stranger_one"); !errors.Is(err, ErrNotAllowed) {
-		t.Fatalf("Resolve постороннего: err = %v, ожидали ErrNotAllowed", err)
+		t.Fatalf("Resolve of an outsider: err = %v, expected ErrNotAllowed", err)
 	}
-	if _, err := transport.Send(ctx, Peer{Username: "stranger_one"}, "текст", 1); !errors.Is(err, ErrNotAllowed) {
-		t.Fatalf("Send постороннему: err = %v, ожидали ErrNotAllowed", err)
+	if _, err := transport.Send(ctx, Peer{Username: "stranger_one"}, "text", 1); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("Send to an outsider: err = %v, expected ErrNotAllowed", err)
 	}
 }
 
-// Lookup читает диалог и при непустом allow-list: рубеж стоит на Resolve и
-// Send, а не на чтении. Без этого dev-контур не может прочитать диалог с
-// тем, кому уже нельзя писать.
+// Lookup reads a dialog even with a non-empty allow-list: the guard sits on
+// Resolve and Send, not on reading. Without this the dev stack cannot read a
+// dialog with someone who can no longer be written to.
 func TestLookupIgnoresAllowList(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
@@ -66,28 +66,28 @@ func TestLookupIgnoresAllowList(t *testing.T) {
 
 	peer, err := transport.Lookup(ctx, "stranger_one")
 	if err != nil {
-		t.Fatalf("Lookup постороннего вне allow-list: %v", err)
+		t.Fatalf("Lookup of an outsider outside the allow-list: %v", err)
 	}
 	if peer.Username != "stranger_one" {
-		t.Fatalf("Lookup вернул Peer %+v, ожидали ник stranger_one", peer)
+		t.Fatalf("Lookup returned Peer %+v, expected username stranger_one", peer)
 	}
 }
 
-// Dry-run History отдаёт то, что было отправлено через Send: подставного
-// живого Telegram нет, единственная история - собственный журнал.
+// Dry-run History returns what was sent through Send: there is no fake live
+// Telegram, the only history is its own journal.
 func TestDryRunHistoryReturnsOwnJournal(t *testing.T) {
 	service := newService(t)
 	ctx := context.Background()
 
 	transport := NewDryRunTransport(service.cfg)
 	peer := Peer{Username: "ivan_petrov"}
-	if _, err := transport.Send(ctx, peer, "первое", 1); err != nil {
+	if _, err := transport.Send(ctx, peer, "first", 1); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if _, err := transport.Send(ctx, peer, "второе", 2); err != nil {
+	if _, err := transport.Send(ctx, peer, "second", 2); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if _, err := transport.Send(ctx, Peer{Username: "other_one"}, "чужое", 3); err != nil {
+	if _, err := transport.Send(ctx, Peer{Username: "other_one"}, "foreign", 3); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -96,33 +96,33 @@ func TestDryRunHistoryReturnsOwnJournal(t *testing.T) {
 		t.Fatalf("History: %v", err)
 	}
 	if len(history) != 2 {
-		t.Fatalf("History вернула %d сообщений, ожидали 2: %+v", len(history), history)
+		t.Fatalf("History returned %d messages, expected 2: %+v", len(history), history)
 	}
-	if history[0].Text != "первое" || !history[0].Outgoing {
-		t.Fatalf("первое сообщение журнала = %+v", history[0])
+	if history[0].Text != "first" || !history[0].Outgoing {
+		t.Fatalf("first journal message = %+v", history[0])
 	}
-	if history[1].Text != "второе" || !history[1].Outgoing {
-		t.Fatalf("второе сообщение журнала = %+v", history[1])
+	if history[1].Text != "second" || !history[1].Outgoing {
+		t.Fatalf("second journal message = %+v", history[1])
 	}
 }
 
-// Живой транспорт вне prod не поднимается: процесс отказывается стартовать, а
-// не поднимается с молчащей отправкой.
+// The live transport does not come up outside prod: the process refuses to
+// start rather than coming up with a silent send.
 func TestLiveRefusedOutsideProd(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
 	t.Setenv("ACCOUNT_LABEL", "test")
 	resetLiveEnv(t)
-	// Предмет теста - живой транспорт, поэтому он ставится после сброса.
+	// The subject of the test is the live transport, so it is set after the reset.
 	t.Setenv("TRANSPORT", "live")
 
 	t.Setenv("ENV", "dev")
 	if _, err := LoadConfig(); err == nil {
-		t.Fatal("конфиг с TRANSPORT=live поднялся в dev")
+		t.Fatal("config with TRANSPORT=live came up in dev")
 	}
 
 	t.Setenv("ENV", "prod")
 	cfg, err := LoadConfig()
 	if err != nil || cfg.Transport != "live" {
-		t.Fatalf("живой транспорт в prod: %v, транспорт %q", err, cfg.Transport)
+		t.Fatalf("live transport in prod: %v, transport %q", err, cfg.Transport)
 	}
 }

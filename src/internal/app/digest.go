@@ -14,20 +14,21 @@ import (
 	"github.com/daniil4545/tg-agent-mcp/internal/telegram"
 )
 
-// digestHour - час МСК, с которого уходит вечерняя сводка: окно отправки
-// закрывается в 19:00, и к этому моменту день кампании уже посчитан. Верхней
-// границы нет намеренно: процесс, поднятый в 21:00, сводку за день ещё
-// отправит, а новые сутки - это уже другой ключ замка.
+// digestHour is the Moscow hour from which the evening digest goes out: the
+// send window closes at 19:00, and by then the campaign day is already counted.
+// There is deliberately no upper bound: a process started at 21:00 still sends
+// the day's digest, and a new day is a different lock key.
 const digestHour = 19
 
-// digestWarnHour - с какого часа МСК процесс, который сводку не отправляет,
-// начинает проверять, ушла ли она вообще. Час запаса после digestHour нужен,
-// чтобы не предупреждать о сводке, которую отправитель в эту минуту и шлёт.
+// digestWarnHour is the Moscow hour from which a process that does not send
+// the digest starts checking whether it went out at all. The hour of slack
+// after digestHour avoids warning about a digest the sender is sending at that
+// very minute.
 const digestWarnHour = 20
 
-// digestAccount - строка сводки по одному отправщику. Заказчику нужен разрез по
-// аккаунтам, а не только итог: аккаунт, замолчавший из-за стопа, виден только
-// здесь.
+// digestAccount is the digest line for one sender. The owner needs a
+// per-account breakdown, not only the total: an account silenced by a stop is
+// visible only here.
 type digestAccount struct {
 	Label      string
 	Sent       int
@@ -38,12 +39,13 @@ type digestAccount struct {
 	StopReason string
 }
 
-// maybeSendDigest отправляет вечернюю сводку, если её время пришло и никто её
-// сегодня не отправил. Зовётся из цикла отправщика между витками: отправка
-// живёт внутри сессии MTProto, и отдельной горутине транспорт недоступен.
+// maybeSendDigest sends the evening digest if its time has come and nobody has
+// sent it today. It is called from the sender loop between passes: sending
+// lives inside the MTProto session, and a separate goroutine cannot reach the
+// transport.
 //
-// Ошибку возвращает, но цикл на ней не останавливается - решает вызывающий:
-// рассылка писем важнее отчёта о ней.
+// It returns the error, but the loop does not stop on it - the caller decides:
+// sending the mailing matters more than the report about it.
 func (s *Sender) maybeSendDigest(ctx context.Context) error {
 	if s.chat == nil {
 		return nil
@@ -52,16 +54,16 @@ func (s *Sender) maybeSendDigest(ctx context.Context) error {
 	if !digestDue(now) {
 		return nil
 	}
-	// В dry-run письмо не уходит, а замок съел бы день: вечером живого контура
-	// сводка оказалась бы уже отправленной.
+	// In dry-run no message goes out, but the lock would eat the day: in the
+	// evening of the live setup the digest would already count as sent.
 	if s.service.cfg.Transport != "live" {
 		return nil
 	}
 
-	// Сводку отправляет один названный аккаунт: иначе при нескольких
-	// отправщиках она приходит то из одного чата, то из другого. Остальные
-	// молчат, но смотрят, ушла ли она: метка без живого процесса остановила бы
-	// сводку насовсем и молча.
+	// One named account sends the digest: otherwise, with several senders, it
+	// arrives now from one chat, now from another. The others stay silent but
+	// check whether it went out: a label without a live process would stop the
+	// digest for good and without a word.
 	if digestLabel := s.service.cfg.DigestAccount; digestLabel != "" && digestLabel != s.label {
 		s.service.warnDigestMissing(ctx, now, digestLabel)
 		return nil
@@ -88,9 +90,9 @@ func (s *Sender) maybeSendDigest(ctx context.Context) error {
 			}
 		}
 		if _, err := s.chat.Send(ctx, owner, text); err != nil {
-			// Замок снимается, чтобы следующий виток того же дня попробовал
-			// снова: строка direct_messages при этом остаётся failed, как у
-			// любой прямой отправки.
+			// The lock is released so that the next pass of the same day tries
+			// again: the direct_messages row stays failed, as for any direct
+			// send.
 			s.service.dropDigest(ctx, id)
 			return fmt.Errorf("digest to @%s: %w", owner, err)
 		}
@@ -102,11 +104,11 @@ func (s *Sender) maybeSendDigest(ctx context.Context) error {
 	return nil
 }
 
-// warnDigestMissing называет в журнале вечер, в который сводка не ушла ни
-// одному получателю. Спрашивает тот, кто её не отправляет: свой отказ он видит
-// и так, а молчащий отправитель сводки иначе не виден никому. Ошибка чтения -
-// тоже строка журнала: это наблюдаемость, а не рубеж, и останавливать ею
-// рассылку нельзя.
+// warnDigestMissing names in the log an evening when the digest reached no
+// recipient. It is asked by the process that does not send the digest: it sees
+// its own failure anyway, while a silent digest sender is otherwise visible to
+// nobody. A read error is also a log line: this is observability, not a guard,
+// and it must not stop the mailing.
 func (s *Service) warnDigestMissing(ctx context.Context, now time.Time, digestLabel string) {
 	missing, err := s.digestMissing(ctx, now)
 	if err != nil {
@@ -115,12 +117,12 @@ func (s *Service) warnDigestMissing(ctx context.Context, now time.Time, digestLa
 	}
 	if missing {
 		slog.Warn("digest not sent today", "digest_account", digestLabel,
-			"note", "сводку отправляет только аккаунт DIGEST_ACCOUNT: проверьте, поднят ли он")
+			"note", "only the DIGEST_ACCOUNT account sends the digest: check that it is running")
 	}
 }
 
-// digestMissing - не ушла ли сегодня сводка ни одному получателю. Раньше
-// digestWarnHour вопрос не имеет смысла: отправитель в это время её и шлёт.
+// digestMissing reports whether the digest reached no recipient today. Before
+// digestWarnHour the question is meaningless: the sender is sending it then.
 func (s *Service) digestMissing(ctx context.Context, now time.Time) (bool, error) {
 	if now.In(moscowZone).Hour() < digestWarnHour {
 		return false, nil
@@ -134,8 +136,9 @@ func (s *Service) digestMissing(ctx context.Context, now time.Time) (bool, error
 	return sent == 0, nil
 }
 
-// digestDue - настало ли время сводки: будний день и время после digestHour по
-// МСК. Однократность держит замок в БД, а не это условие.
+// digestDue reports whether the digest is due: a weekday and a time after
+// digestHour Moscow time. Once-only delivery is held by the database lock, not
+// by this condition.
 func digestDue(now time.Time) bool {
 	local := now.In(moscowZone)
 	if local.Weekday() == time.Saturday || local.Weekday() == time.Sunday {
@@ -144,9 +147,10 @@ func digestDue(now time.Time) bool {
 	return local.Hour() >= digestHour
 }
 
-// digestCampaignSQL - порядок currentCampaignSQL без черновика: status ставит
-// черновик выше закрытых, и после закрытия кампании с загруженной следующей
-// сводка ушла бы о черновике с нулями вместо итога.
+// digestCampaignSQL is the order of currentCampaignSQL without the draft:
+// status ranks a draft above closed campaigns, and after a campaign closes
+// with the next one loaded, the digest would go out about the draft with zeros
+// instead of the result.
 const digestCampaignSQL = `SELECT id FROM campaigns
 	WHERE status <> 'draft'
 	ORDER BY CASE status
@@ -156,8 +160,8 @@ const digestCampaignSQL = `SELECT id FROM campaigns
 	END, finished_at DESC NULLS LAST, id DESC
 	LIMIT 1`
 
-// digestCampaign - о какой кампании сводка. Запущенных кампаний нет вовсе -
-// ноль, и это не ошибка.
+// digestCampaign returns the campaign the digest is about. When no campaign
+// was ever started it returns zero, which is not an error.
 func (s *Service) digestCampaign(ctx context.Context) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx, digestCampaignSQL).Scan(&id)
@@ -170,8 +174,8 @@ func (s *Service) digestCampaign(ctx context.Context) (int64, error) {
 	return id, nil
 }
 
-// claimDigest берёт сводку дня для одного адресата. Ноль означает, что её уже
-// взял другой отправщик или она сегодня ушла: вставка и есть замок.
+// claimDigest takes the day's digest for one recipient. Zero means another
+// sender has already taken it or it went out today: the insert is the lock.
 func (s *Service) claimDigest(ctx context.Context, now time.Time, owner string, campaignID int64, label string) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx,
@@ -196,17 +200,20 @@ func (s *Service) finishDigest(ctx context.Context, id int64) error {
 	return nil
 }
 
-// dropDigest снимает замок после неудачной отправки. Ошибку только логируем:
-// вызывающий уже несёт причину отказа, и подменять её отказом снятия нельзя.
+// dropDigest releases the lock after a failed send. The error is only logged:
+// the caller already carries the cause of the failure, and it must not be
+// replaced by the release failure.
 func (s *Service) dropDigest(ctx context.Context, id int64) {
 	if _, err := s.pool.Exec(ctx, `DELETE FROM daily_digest WHERE id = $1`, id); err != nil {
 		slog.Warn("digest lock not released", "id", id, "error", err)
 	}
 }
 
-// digestText собирает текст сводки: день по кампании, разрез по аккаунтам,
-// итог и прогноз даты последнего письма, под ними воронка кампании по
-// аккаунтам, итог кампании и итог всех рассылок.
+// digestText builds the digest text: the campaign day, the per-account
+// breakdown, the total and the forecast date of the last message, below them
+// the campaign funnel by account, the campaign total and the total of all
+// mailings. The text is addressed to the Russian-speaking owner and is
+// deliberately in Russian.
 func (s *Service) digestText(ctx context.Context, campaignID int64, now time.Time) (string, error) {
 	report, err := s.StatusOf(ctx, campaignID, false)
 	if err != nil {
@@ -281,8 +288,9 @@ func (s *Service) digestText(ctx context.Context, campaignID int64, now time.Tim
 	return b.String(), nil
 }
 
-// digestFunnel - воронка рассылки: взято в работу, отправлено, доставлено,
-// ответили. Снятые рубежом и отменённые строки в работу не шли и не считаются.
+// digestFunnel is the mailing funnel: taken into work, sent, delivered,
+// replied. Rows removed by a guard and cancelled rows never went into work and
+// are not counted.
 type digestFunnel struct {
 	Label     string
 	Taken     int
@@ -291,24 +299,26 @@ type digestFunnel struct {
 	Replied   int
 }
 
-// funnelColumns считает воронку по строкам recipients r. Отправкой считается и
-// брак ника: письмо ушло в Telegram, но адресата нет. Прочие undelivered - сбой
-// сервиса, до лида письмо не дошло.
+// funnelColumns counts the funnel over recipients rows r. A bad username also
+// counts as sent: the message went to Telegram, but the addressee does not
+// exist. Other undelivered rows are a service failure, the message never
+// reached the lead.
 const funnelColumns = `count(*) FILTER (WHERE r.state IN ('planned', 'sent', 'replied', 'undelivered')),
 	count(*) FILTER (WHERE r.state IN ('sent', 'replied')
 		OR (r.state = 'undelivered' AND r.reason IN ('` + telegram.KindPeerForbidden + `', '` + telegram.KindNotPerson + `'))),
 	count(*) FILTER (WHERE r.state IN ('sent', 'replied')),
 	count(*) FILTER (WHERE r.state = 'replied')`
 
-// Ширина колонок таблицы в символах: вся строка укладывается в 34 знака и
-// влезает в экран телефона без переноса.
+// Table column widths in characters: the whole line fits in 34 characters and
+// fits a phone screen without wrapping.
 const (
 	labelWidth = 10
 	cellWidth  = 6
 )
 
-// rows - воронка строками таблицы: числа и под ними доля каждого шага от
-// предыдущего числа. Без взятых долей нет ни одной, и строка долей не нужна.
+// rows renders the funnel as table lines: the numbers and under them the share
+// of each step relative to the previous number. With nothing taken there are
+// no shares, and the shares line is not needed.
 func (f digestFunnel) rows(label string) string {
 	if runes := []rune(label); len(runes) > labelWidth {
 		label = string(runes[:labelWidth])
@@ -322,8 +332,8 @@ func (f digestFunnel) rows(label string) string {
 		cellWidth, share(f.Sent, f.Taken), cellWidth, share(f.Delivered, f.Sent), cellWidth, share(f.Replied, f.Delivered))
 }
 
-// share - доля в процентах. При нулевом знаменателе доли нет, и печатать
-// нечего: «0%» читался бы как провал шага.
+// share returns a percentage. With a zero denominator there is no share and
+// nothing to print: "0%" would read as a failed step.
 func share(part, whole int) string {
 	if whole == 0 {
 		return ""
@@ -331,10 +341,10 @@ func share(part, whole int) string {
 	return fmt.Sprintf("%d%%", int(math.Round(float64(part)*100/float64(whole))))
 }
 
-// digestTotals - воронка по строкам под условием where, без служебных
-// адресатов: их строки есть в каждой кампании и сложились бы по числу
-// рассылок. Второе значение - сколько кампаний хоть кого-то взяли в работу:
-// отменённая до старта рассылкой не была.
+// digestTotals returns the funnel over rows matching the where condition,
+// without service recipients: their rows exist in every campaign and would add
+// up by the number of mailings. The second value is how many campaigns took
+// anyone into work: one cancelled before the start was not a mailing.
 func (s *Service) digestTotals(ctx context.Context, where string, args ...any) (digestFunnel, int, error) {
 	var f digestFunnel
 	var campaigns int
@@ -350,8 +360,9 @@ func (s *Service) digestTotals(ctx context.Context, where string, args ...any) (
 	return f, campaigns, nil
 }
 
-// digestAccountFunnels - воронка кампании по каждому аккаунту из summaries, в
-// том же порядке, что и дневной разрез; аккаунт без строк остаётся с нулями.
+// digestAccountFunnels returns the campaign funnel for each account in
+// summaries, in the same order as the daily breakdown; an account without rows
+// keeps zeros.
 func (s *Service) digestAccountFunnels(ctx context.Context, campaignID int64, summaries []AccountSummary) ([]digestFunnel, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT a.label, `+funnelColumns+`
@@ -386,9 +397,9 @@ func (s *Service) digestAccountFunnels(ctx context.Context, campaignID int64, su
 	return out, nil
 }
 
-// digestAccounts - дневной счёт по каждому аккаунту. Аккаунт без отправок
-// остаётся в списке с нулём: молчащий отправщик и есть то, ради чего сводку
-// читают.
+// digestAccounts returns the daily count per account. An account without sends
+// stays in the list with zero: a silent sender is exactly what the digest is
+// read for.
 func (s *Service) digestAccounts(ctx context.Context, campaignID int64, from time.Time, summaries []AccountSummary) ([]digestAccount, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT a.label,
@@ -439,9 +450,9 @@ func stoppedLabels(accounts []digestAccount) []string {
 	return out
 }
 
-// finishDay - когда уйдёт последнее письмо при нынешних потолках. Считается по
-// будням: в выходные окно отправки закрыто. Остановленные аккаунты в темп не
-// входят - они сегодня не отправляют.
+// finishDay returns when the last message goes out at the current caps. It
+// counts weekdays only: the send window is closed on weekends. Stopped accounts
+// do not contribute to the pace - they do not send today.
 func finishDay(now time.Time, queued int, accounts []digestAccount) time.Time {
 	var pace int
 	for _, a := range accounts {
@@ -468,7 +479,8 @@ func dayStart(now time.Time) time.Time {
 	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, moscowZone)
 }
 
-// dayWords - дата словами, как её пишет человек: «15 сентября».
+// dayWords returns the date in words as a person writes it: "15 сентября".
+// The month names are Russian because the digest text is Russian.
 func dayWords(day time.Time) string {
 	months := [...]string{"января", "февраля", "марта", "апреля", "мая", "июня",
 		"июля", "августа", "сентября", "октября", "ноября", "декабря"}
