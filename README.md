@@ -267,15 +267,19 @@ publishes no database port.
 ```sh
 cd src
 docker compose up -d
-make ci-check       # migrations, tests, vet, gofmt, golangci-lint, build
+make ci-check       # lint, migrations, tests, build
 make test-fast      # fast tier, no database
 ```
 
 The integration tier needs `TEST_DATABASE_URL`, separate from `DATABASE_URL`, a
 guard against migrating the wrong database; the Makefile defaults it to the
 compose database. Without a database `go test` skips the integration tier, and
-`make test` fails instead of skipping. CI runs the same `make ci-check` against
+`make test` fails instead of skipping. CI runs `make lint`, then the tests against
 a PostgreSQL service container.
+
+## Development
+
+Checks: `make lint`
 
 ## Limitations
 

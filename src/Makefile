@@ -23,7 +23,7 @@ SENDER := docker compose -f docker-compose.sender.yml
 ACCOUNTS_DIR := accounts
 SENDER_PROJECT := tg-agent-mcp-acc-$(label)
 
-.PHONY: run build test test-fast vet fmt-check lint commit-check ci-check deploy-check check-db migrate-up migrate-down \
+.PHONY: run build test test-fast vet fmt-check lint ci-check deploy-check check-db migrate-up migrate-down \
         live-up live-down live-logs live-authorize live-dump \
         accounts check-account account-up account-authorize account-live account-down account-logs
 
@@ -54,13 +54,11 @@ fmt-check:
 	@out=$$(gofmt -l ./cmd ./internal); \
 	test -z "$$out" || { echo "gofmt needed:"; echo "$$out"; exit 1; }
 
-lint:
+# All Go statics: formatting, vet, golangci-lint (v2.15.0, pinned in CI).
+lint: fmt-check vet
 	golangci-lint run --timeout 120s
 
-# Commit ring: seconds, no database. The full set closes a slice (ci-check).
-commit-check: fmt-check vet lint test-fast
-
-ci-check: migrate-up test vet fmt-check lint build
+ci-check: lint migrate-up test build
 
 # The Coolify stack syntax is checked before a rollout: a typo in compose would
 # otherwise surface on the host, where it is most expensive to fix.
