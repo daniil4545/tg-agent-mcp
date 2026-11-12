@@ -41,7 +41,7 @@ jobs:
         with:
           # Pinned: a linter built with an older Go refuses to read the module.
           version: v2.15.0
-          # make ci-check runs the linter itself; the action only installs it.
+          # make lint runs the linter itself; the action only installs it.
           install-only: true
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: lint
